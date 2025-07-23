@@ -1,13 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/**
- * Copyright (c) 2025 Syswonder
- *
- * Syswonder Website:
- *      https://www.syswonder.org
- *
- * Authors:
- *      Guowei Li <2401213322@stu.pku.edu.cn>
- */
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -21,7 +11,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <assert.h>
+#include <stdint.h>
 
+#include "cJSON.h"
 #include "event_monitor.h"
 #include "hvisor.h"
 #include "log.h"
@@ -669,14 +662,703 @@ static int zone_list(int argc, char *argv[]) {
     close(fd);
     return ret;
 }
+char *open_json_file(const char *json_config_path) {
+    FILE *file = fopen(json_config_path, "r");
+    if (file == NULL) {
+        printf("Error opening json file: %s\n", json_config_path);
+        fprintf(stderr, "Error opening json file: %s\n", json_config_path);
+        exit(1);
+    }
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    char *buffer = malloc(file_size + 1);
+    if (fread(buffer, 1, file_size, file) == 0) {
+        printf("Error reading json file: %s\n", json_config_path);
+        fprintf(stderr, "Error reading json file: %s\n", json_config_path);
+        goto err_out;
+    }
+    fclose(file);
+    buffer[file_size] = '\0';
 
+    // printf("Parsing json file: %s\n", json_config_path);
+
+    return buffer;
+err_out:
+    free(buffer);
+    return NULL;
+}
+
+#ifdef LOONGARCH64
+static int start_exception_trace()
+{
+    int fd = open_dev();
+    int ret = ioctl(fd, HVISOR_HC_START_EXCEPTION_TRACE, NULL);
+    if (ret < 0)
+        perror("start_exception_trace: ioctl failed");
+    return ret;
+}
+
+static int end_exception_trace()
+{
+    int fd = open_dev();
+    int ret = ioctl(fd, HVISOR_HC_END_EXCEPTION_TRACE, NULL);
+    if (ret < 0)
+        perror("end_exception_trace: ioctl failed");
+    return ret;
+}
+#endif
+
+#ifdef LOONGARCH64
+// shared memory
+static int test_shm_signal(int argc, char *argv[]) {
+    // dst zone_id
+    if (argc != 2 || strcmp(argv[0], "-id") != 0) {
+        help(1);
+    }
+    __u64 target_zone_id;
+    sscanf(argv[1], "%llu", &target_zone_id);
+
+    shm_args_t args;    
+    args.target_zone_id = target_zone_id;
+    
+    int fd = open_dev();
+    int ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
+    if (ret < 0) {
+        perror("test_shm_signal: ioctl failed");
+    }
+}
+
+#endif
+#ifdef ARM64
+static int start_exception_trace()
+{
+    int fd = open_dev();
+    int ret = ioctl(fd, HVISOR_HC_START_EXCEPTION_TRACE, NULL);
+    if (ret < 0)
+        perror("start_exception_trace: ioctl failed");
+    return ret;
+}
+
+static int end_exception_trace()
+{
+    int fd = open_dev();
+    int ret = ioctl(fd, HVISOR_HC_END_EXCEPTION_TRACE, NULL);
+    if (ret < 0)
+        perror("end_exception_trace: ioctl failed");
+    return ret;
+}
+#endif
+
+#ifdef ARM64
+// shared memory
+static int test_shm_signal(int argc, char *argv[]) {
+    // dst zone_id
+    if (argc != 2 || strcmp(argv[0], "-id") != 0) {
+        help(1);
+    }
+    __u64 target_zone_id;
+    sscanf(argv[1], "%llu", &target_zone_id);
+
+    shm_args_t args;    
+    args.target_zone_id = target_zone_id;
+    
+    int fd = open_dev();
+    int ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
+    if (ret < 0) {
+        perror("test_shm_signal: ioctl failed");
+    }
+}
+
+#endif
+
+#include "shm/addr.h"
+#include "shm/msg.h"
+#include "shm/shm.h"
+#include "shm/client.h"
+#include "shm/config/config_zone.h"
+#include "service/safe_service.h"
+
+static Service services[] = {
+    {0, "null", 0},
+    {1, "echo string", 0},
+    {2, "flip the digit", 1},
+    {3, "Caesar encrypt", 1},
+    {4, "Caesar decrypt", 1},
+    {5, "XOR encrypt", 1},
+    {6, "XOR decrypt", 1},
+    {7, "ROT13 encrypt", 1},    
+    {8, "ROT13 decrypt", 1},
+    {9, "DJB2 hash", 1},
+    {10, "CRC32 hash", 1},
+    {11, "FNV hash", 1},
+    {12, "XORSHIFT random number generator", 1},
+    {13, "LCG random number generator", 1},
+    {14, "random string generator", 1},
+    {15, "random character generator", 1}
+};
+
+static void print_services() {
+    printf(" %-15s | %-40s | %-20s\n", "Safe Service ID", "Description", "Requires Return Value");
+    printf("---------------------------------------------------------------\n");
+    int size = sizeof(services) / sizeof(services[0]);
+    for (int i = 0; i < size; i++) {
+        printf(" %-15u | %-40s | %-20s\n", 
+               services[i].id, 
+               services[i].description, 
+               services[i].need_fetch_data ? "Yes" : "No");
+    }
+}
+
+int general_safe_service_request(struct Client* amp_client, 
+    struct Msg* msg, uint32_t service_id, uint8_t* data, uint32_t data_size, char* output_path) {
+    
+    // step 1: reset msg
+    msg_ops.msg_reset(msg);
+
+    // step 2: malloc shared memory
+    uint8_t* shm_data = (uint8_t*)client_ops.shm_malloc(amp_client, data_size + 1, MALLOC_TYPE_V);
+    if (shm_data == NULL)
+    {
+        printf("[Error] shm malloc [size = %u, type = %u, ptr = NULL]\n", 
+            data_size + 1, MALLOC_TYPE_V);
+        return -1;
+    }
+    // printf("[Trace] shm malloc [size = %u, type = %u, ptr = %p]\n", 
+    //     data_size + 1, MALLOC_TYPE_V, shm_data);
+    
+    // step 3: copy data to shared memory
+    if (data_size > 0) {
+        for (int j = 0; j < data_size; j++)
+        {
+            shm_data[j] = data[j];
+        }    
+        shm_data[data_size] = '\0';
+        // printf("[Trace] shm_data: %s, data_size = %d\n", shm_data, data_size);
+    }
+    
+    // step 4: fill msg
+    msg->offset = client_ops.shm_addr_to_offset(shm_data);
+    msg->length = data_size + 1;
+    // printf("[Trace] info : msg fill [offset = 0x%x, length = %u]\n", msg->offset, msg->length);
+
+    // step 5: send + notify
+    if (client_ops.msg_send_and_notify(amp_client, msg) != 0)
+    {
+        printf("[Error] msg send [offset = %x, length = %u], check it\n", msg->offset, msg->length);
+        return -1;
+    }
+    // printf("[Trace] msg send [offset = %x, length = %u]\n", msg->offset, msg->length);
+
+    // step 6: wait for response
+    // client_ops.set_client_request_cnt(amp_client); // += 1
+    // uint32_t request_cnt = client_ops.get_client_request_cnt(amp_client); // record request cnt to r21 register
+    // while(client_ops.msg_poll(msg, request_cnt) != 0) {
+    //     printf("is polling...\n");
+    //     sleep(3);
+    // }
+    while(client_ops.msg_poll(msg) != 0) {
+        // printf("is polling...\n");
+        // sleep(3);
+    }
+
+
+    // printf("[Trace] msg result [service_id = %u, result = %u]\n",
+    //         msg->service_id, msg->flag.service_result);
+    
+    // step 7: fetch result data from shared memory
+    if (services[service_id].need_fetch_data) {
+        if (output_path!= NULL) {
+            // write result data to file
+            FILE *file;
+            file = fopen(output_path, "w");
+            if (file == NULL) {
+                printf("open file failed\n");
+                return -1;
+            }
+            fprintf(file, "%s", shm_data);
+            fclose(file);
+        } else {
+            printf("service_id : %d, result %s\n", service_id, shm_data);
+        }
+    }
+
+    // step 8: free shared memory
+    client_ops.shm_free(amp_client, shm_data);
+
+    return 0;
+}
+
+static int test_shm(char* shm_json_path) {
+    parse_global_addr(shm_json_path);
+
+    struct Client amp_client = { 0 };
+    if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
+    {
+        printf("client init failed\n");
+        while(1) {}
+    }
+    // printf("client init success\n");
+    
+    struct Msg *msg = client_ops.empty_msg_get(&amp_client, NPUCore_SERVICE_ECHO_ID);
+    if (msg == NULL)
+    {
+        printf("error : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
+        return;
+    }
+    // printf("info : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
+
+    char data[100] = "hello world";
+    int data_size = strlen(data);
+    int send_count = 1;
+    for (int i = 0; i < send_count; i++) {
+        msg_ops.msg_reset(msg);
+        // TODO: compare to OpenAMP
+        // using shared memory
+        char* shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_V);
+        if (shm_data == NULL)
+        {
+            printf("error : shm malloc [idx = %d, size = %u, type = %u, ptr = NULL]\n", 
+                i, data_size + 1, MALLOC_TYPE_V);
+            return;
+        }
+        // printf("info : shm malloc [idx = %d, size = %u, type = %u, ptr = %p]\n", 
+        //     i, data_size + 1, MALLOC_TYPE_V, shm_data);
+        
+        int j = 0;
+        for (j = 0; j < data_size; j++)
+        {
+            shm_data[j] = data[j];
+        }
+        shm_data[data_size] = '\0';
+        
+        // printf("shm_data: %s, data_size = %d\n", shm_data, data_size);
+        msg->offset = client_ops.shm_addr_to_offset(shm_data);
+        msg->length = data_size + 1;
+        // printf("info : msg fill [idx = %d, offset = 0x%x, length = %u]\n", i, msg->offset, msg->length);
+
+        // TODO: check this offset, if necessary ? can't use virtual address?
+        
+        // send + notify
+        if (client_ops.msg_send_and_notify(&amp_client, msg) != 0)
+        {
+            printf("error : msg send [idx = %d, offset = %x, length = %u], check it\n", i, msg->offset, msg->length);
+            return;
+        }
+        // printf("info : msg send [idx = %d, offset = %x, length = %u]\n", i, msg->offset, msg->length);
+
+        // printf("enter polling...\n");
+        /* 等待消息响应 */
+        // client_ops.set_client_request_cnt(&amp_client); // += 1
+        // uint32_t request_cnt = client_ops.get_client_request_cnt(&amp_client);
+        // while(client_ops.msg_poll(msg, request_cnt) != 0) {
+            
+        // }
+        while(client_ops.msg_poll(msg) != 0) {
+            // printf("is polling...\n");
+            // sleep(3);
+        }
+        
+        // printf("info : msg result [idx = %d, service_id = %u, result = %u]\n",
+        //        i, msg->service_id, msg->flag.service_result);
+
+        client_ops.shm_free(&amp_client, shm_data);
+    }
+    client_ops.empty_msg_put(&amp_client, msg);
+    client_ops.client_destory(&amp_client);
+}
+
+static int check_service_id(uint32_t service_id) {
+    if (service_id == 0 || service_id >= NPUCore_SERVICE_MAX_ID) {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
+static int safe_service(int argc, char *argv[]) {
+    // service_id data data_size
+    if (argc != 4) {
+        help(1);
+    } 
+    // 0. shm_json_path
+    parse_global_addr(argv[0]);
+
+    // 1. service_id (uint32_t)
+    uint32_t service_id = 0;
+    sscanf(argv[1], "%u", &service_id);
+    if (check_service_id(service_id)) {
+        printf("[Error] invalid service_id\n");
+        print_services();
+        return -1;
+    }
+
+    // 2. data (bytes array, don't care the type)
+    uint8_t* data = argv[2];
+
+    // 3. data_size (uint32_t)
+    uint32_t data_size;
+    sscanf(argv[3], "%u", &data_size);
+    if (data_size == 0) {
+        // if provided data_size is 0, use the length of data_size as msg->length
+        data_size = strlen(data);
+    }
+
+    // printf("[Check] argv[0] : %s, service_id : %u, data : %s, data_size : %u\n",
+    //      argv[0], service_id, data, data_size);
+
+    // step 1: init client
+    struct Client amp_client = {0};
+    if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
+    {
+        printf("[Error] client init failed\n");
+        return -1;
+    }
+    // printf("[Trace] client init success\n");
+
+    // step 2: get empty msg
+    struct Msg *msg = client_ops.empty_msg_get(&amp_client, service_id);
+    if (msg == NULL)
+    {
+        printf("[Error] empty msg get [service_id = %u]\n", service_id);
+        return -1;
+    }
+    // printf("[Trace] empty msg get [service_id = %u]\n", service_id);
+
+    // step 3: do safe service request
+    int ret = general_safe_service_request(&amp_client, msg, service_id, data, data_size, NULL);
+    if (ret != 0) {
+        printf("[Error] safe service request failed\n");
+        return -1;
+    }
+
+    // step 4: put empty msg
+    client_ops.empty_msg_put(&amp_client, msg);   
+    // printf("[Trace] empty msg put [service_id = %u]\n", service_id);
+    
+    // step 5: destory client
+    client_ops.client_destory(&amp_client);
+    // printf("[Trace] client destory [service_id = %u]\n", service_id);
+}
+
+#include "shm/threads.h"
+#include "shm/requests.h"
+
+static int parse_and_enqueue(ThreadPool* pool, struct Client* client, const char *input_line, 
+    uint32_t request_id, char* output_dir) {
+    // Example input line: "1 "PTejVyahf" 01"
+    Request *request = (Request*)malloc(sizeof(Request));
+
+    uint8_t data_string[256]; // Adjust size as needed
+    unsigned int service_id, size;
+    
+    int parsed = sscanf(input_line, "%u \"%255[^\"]\" %u", &service_id, data_string, &size);
+    if (parsed != 3) {
+        printf("parse ok %s\n", input_line);
+        return -1;
+    }
+    
+    request->data_string = strdup(data_string);
+    if (!request->data_string) {
+        perror("Failed to allocate memory for data string");
+        return -1;
+    }
+    request->request_id = request_id;
+    request->service_id = service_id;
+    request->size = size;
+    request->client = client;
+    // request->output_dir = output_dir;
+
+    request->output_dir = (char *)malloc(strlen(output_dir) + 1 + 10 + 4);
+    if (!request->output_dir) {
+        perror("Failed to allocate memory for new output dir");
+        free(request->data_string);
+        free(request);
+        return -1;
+    }
+
+    // +1 for '/', +10 for request_id, +4 for ".txt" and null terminator
+    snprintf(request->output_dir, strlen(output_dir) + 1 + 10 + 4, "%s/%u.txt", output_dir, request_id);
+
+    // printf("Enqueuing request: request_id=%u, id=%u, data_string=%s,
+    // size=%u\n",
+    //     request.request_id, request.id, request.data_string, request.size);
+    // printf("enqueue request: request_id=%u, output_dir_path=%s\n", 
+    //     request_id, request->output_dir);
+    // enqueue(queue, request);
+
+    add_task(pool, handle_request, request);
+    return 0;
+}
+
+static void read_input_file(ThreadPool* pool, struct Client* client, 
+    char* input_file_path, char* output_dir) {
+    
+    struct stat file_stat;
+    time_t last_mtime = 0;
+    off_t last_size = 0;
+
+    FILE *file = fopen(input_file_path, "r");
+    while (file == NULL) {
+        file = fopen(input_file_path, "r");
+    }
+
+    char line[1024];
+    int request_id = 1;
+
+    while (1) {
+        while (fgets(line, sizeof(line), file) != NULL) {
+            if (parse_and_enqueue(pool, client, line, request_id++, output_dir) != 0) {
+                return;
+            }
+        }
+        clearerr(file);
+        fseek(file, 0, SEEK_CUR);
+        sleep(1);
+    }
+}
+
+static void setup_shm_client(int argc, char *argv[]) {
+    // [0]. shm_json_path
+    char *shm_json_path = argv[0];
+    parse_global_addr(shm_json_path);
+
+    // [1]. input_file_path
+    char *input_file_path = argv[1];
+    
+    // [2]. output_dir_path
+    char *output_dir_path = argv[2];
+
+    // [3]. threads_num
+    int threads_num = atoi(argv[3]);
+
+    // step 1: init client
+    // struct Client amp_client = {0};
+    struct Client *amp_client = (struct Client*)malloc(sizeof(struct Client));
+    memset(amp_client, 0, sizeof(struct Client));
+
+    if (client_ops.client_init(amp_client, ZONE_NPUcore_ID) != 0)
+    {
+        printf("[Error] client init failed\n");
+        return -1;
+    }
+    // printf("client init success\n");
+
+    // step 2: create threads in threads pool
+    ThreadPool* threadpool = setup_threads_pool(threads_num, amp_client);
+    if (threadpool == NULL) {
+        return -1;
+    }
+    // printf("thread_pool init success\n");
+
+    // step 3: read input file and send requests to threads
+    read_input_file(threadpool, amp_client, input_file_path, output_dir_path);
+    
+    // printf("read_input_file success\n");
+
+    // step 4: wait ...
+    while(!task_queue_is_empty(threadpool)) {
+        // wait for all tasks to be completed
+        sleep(1);
+    }
+
+    // step 5: free_request_queue(queue);
+    destroy_thread_pool(threadpool);
+    
+    // step 6: destory client
+    client_ops.client_destory(amp_client);
+    
+    free(amp_client);
+}
+
+
+static void generate_random_string(char *str, size_t length) {
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    size_t charset_size = sizeof(charset) - 1;
+    for (size_t i = 0; i < length - 1; i++) {
+        int key = rand() % charset_size;
+        str[i] = charset[key];
+    }
+    str[length - 1] = '\0';
+}
+
+static void service_request_gen(int argc, char *argv[]) {
+    if (argc < 2) {
+        help(1);
+    }
+    char *input_file_path = argv[0];
+    int num_iterations = atoi(argv[1]);
+
+    srand(time(NULL));
+    FILE *file = fopen(input_file_path, "a");
+    if (file == NULL) {
+        perror("Failed to open file");
+        return;
+    }
+    for (int i = 0; i < num_iterations; i++) {
+        size_t random_length = 5 + rand() % (20 - 5 + 1);
+        char *random_string = (char *)malloc(random_length + 1);
+        if (random_string == NULL) {
+            perror("Failed to allocate memory for random string");
+            fclose(file);
+            return;
+        }
+        generate_random_string(random_string, random_length);
+        fprintf(file, "1 \"%s\" 0\n", random_string);
+        free(random_string);
+    }
+    fprintf(file, "0\n");
+    fclose(file);
+}
+int test(int argc, char *argv[]) {
+    int fd;
+    int ret;
+    shm_args_t args;
+    int a;
+    int b;
+    // Open hvisor device
+    fd = open("/dev/hvisor", O_RDWR);
+    if (fd < 0) {
+        printf("Failed to open /dev/hvisor: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    // Prepare arguments
+    args.target_zone_id = strtoul(argv[0], NULL, 10); 
+    args.service_id = strtoul(argv[1], NULL, 10);    
+    args.swi = 0; // Reserved for future use
+
+    // sscanf(argv[0], "%d", &a);
+    // sscanf(argv[1], "%d", &b);
+    // printf("a: %d, b: %d\n", a, b);
+    // Send ioctl
+    ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
+    if (ret < 0) {
+        printf("HVISOR_SHM_SIGNAL ioctl failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    close(fd);
+    printf("Successfully sent SHM signal to zone %lu with service_id %lu\n", 
+           args.target_zone_id, args.service_id);
+    return 0;
+}
+
+#include "shm.h"
+#include <sys/poll.h>
+#include <sys/ioctl.h>
+static volatile int running = 1;
+
+void signal_handler(int sig)
+{
+    printf("Received signal %d, exiting...\n", sig);
+    running = 0;
+}
+
+void print_timestamp(uint64_t ns)
+{
+    uint64_t sec = ns / 1000000000ULL;
+    uint64_t nsec = ns % 1000000000ULL;
+    printf("%lu.%09lu", sec, nsec);
+}
+
+int shm_receiver() {
+    int fd;
+    struct pollfd pfd;
+    int ret;
+    shm_signal_info_t signal_info;
+    int last_signal_count = 0;
+    
+    printf("SHM-based SHM Signal Receiver\n");
+    printf("=============================\n");
+    
+    // 安装信号处理程序
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    // 打开 SHM 设备（使用第一个 SHM 设备）
+    fd = open("/dev/hshm0", O_RDONLY);
+    if (fd < 0) {
+        perror("Failed to open /dev/hshm0");
+        printf("Make sure the SHM driver is loaded and SHM is configured\n");
+        return 1;
+    }
+    
+    printf("Monitoring SHM signals via SHM driver (Press Ctrl+C to exit)...\n\n");
+    
+    // 设置 poll 结构
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    
+    while (running) {
+        // 轮询设备状态
+        ret = poll(&pfd, 1, 1000); // 1 秒超时
+        
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll failed");
+            break;
+        }
+        
+        // 获取 SHM 信号信息
+        ret = ioctl(fd, HVISOR_SHM_SIGNAL_INFO, &signal_info);
+        if (ret < 0) {
+            perror("Failed to get SHM signal info");
+            continue;
+        }
+        
+        // 检查是否有新的信号
+        if (signal_info.signal_count > last_signal_count) {
+            printf("New SHM signals detected!\n");
+            printf("  Total signals: %u (new: %u)\n", 
+                   signal_info.signal_count, 
+                   signal_info.signal_count - last_signal_count);
+            printf("  Last timestamp: ");
+            print_timestamp(signal_info.last_timestamp);
+            printf("\n");
+            printf("  Last service ID: %u\n", signal_info.last_service_id);
+            printf("  Current CPU: %u\n", signal_info.current_cpu);
+            printf("\n");
+            
+            last_signal_count = signal_info.signal_count;
+            
+            // 在这里添加你的自定义处理逻辑
+            // 例如：
+            // - 处理不同的 service_id
+            // - 读取共享内存数据
+            // - 向 root linux 发送响应
+        }
+        
+        // 检查是否有 IVC 事件
+        if (pfd.revents & POLLIN) {
+            printf("IVC event detected (possibly SHM signal)\n");
+        }
+        
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            printf("Device error or disconnection\n");
+            break;
+        }
+    }
+    
+    close(fd);
+    printf("\nReceived total %u SHM signals\n", signal_info.signal_count);
+    printf("Exiting gracefully\n");
+    
+    return 0;
+}
 int main(int argc, char *argv[]) {
     int err = 0;
 
-    if (argc < 3)
+    if (argc < 2) {
         help(1);
-
+    }   
     if (strcmp(argv[1], "zone") == 0) {
+        if (argc < 3) {
+            help(1);
+        }
         if (strcmp(argv[2], "start") == 0) {
             err = zone_start(argc, argv);
         } else if (strcmp(argv[2], "shutdown") == 0) {
@@ -687,14 +1369,66 @@ int main(int argc, char *argv[]) {
             help(1);
         }
     } else if (strcmp(argv[1], "virtio") == 0) {
+        if (argc < 3) {
+            help(1);
+        }
         if (strcmp(argv[2], "start") == 0) {
             err = virtio_start(argc, argv);
         } else {
             help(1);
         }
-    } else {
+    }
+    else if (strcmp(argv[1], "start_exception_trace") == 0)
+    {
+        err = start_exception_trace();
+    }
+    else if (strcmp(argv[1], "end_exception_trace") == 0)
+    {
+        err = end_exception_trace();
+    }
+    // shared memory
+    else if (strcmp(argv[1], "shm") == 0) {
+        if (argc < 3) {
+            help(1);
+        }
+        if (strcmp(argv[2], "test_signal") == 0) {   
+            // hvisor shm test_signal -id <dst_zone_id>
+            err = test_shm_signal(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "test_shm") == 0) {
+            // hvisor shm test_shm <shm_json_path>
+            test_shm(argv[3]);
+        } 
+        else if(strcmp(argv[2], "safe_service") == 0) { 
+            // hvisor shm safe_service <shm_json_path> <service_id> <data> <data_size>
+            safe_service(argc - 3, &argv[3]);
+        } 
+        else if(strcmp(argv[2], "show_safe_service") == 0) {
+            // hvisor shm show_safe_service
+            print_services();
+        }
+        else if(strcmp(argv[2], "setup_shm_client") == 0) {
+            // hvisor shm setup_shm_client <shm_json_path> <input.txt> <output_dir> <threads>
+            setup_shm_client(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "setup_request_gen") == 0) {
+            // hvisor shm request_gen <input_file_path> <num_iterations>
+            service_request_gen(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "test") == 0) {
+            // hvisor shm test 1 0 
+            test(argc-3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "receiver") == 0) {
+            // hvisor shm receiver 
+            shm_receiver();
+        }
+        else {
+            help(1);
+        }
+    }
+    else {
         help(1);
     }
-
     return err ? 1 : 0;
 }

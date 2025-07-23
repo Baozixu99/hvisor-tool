@@ -36,7 +36,11 @@ check-kdir:
 ifeq ($(KDIR),)
 	$(error Linux kernel directory is not set. Please set environment variable 'KDIR')
 endif
-
+cp:
+	chmod +777 tools/hvisor
+	chmod +777 driver/hvisor.ko
+	cp tools/hvisor /mnt/d/Desktop/tftp/ft
+	cp driver/hvisor.ko /mnt/d/Desktop/tftp/ft
 tools: env
 	$(MAKE) -C tools all
 	@mkdir -p $(OUTPUT_DIR)

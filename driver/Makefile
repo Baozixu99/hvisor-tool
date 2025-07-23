@@ -1,5 +1,6 @@
 obj-m += hvisor.o
 obj-m += ivc.o
+obj-m += shm.o
 EXTRA_CFLAGS += "
 
 ifeq ($(ARCH), arm64)
@@ -19,7 +20,7 @@ endif
 EXTRA_CFLAGS += -I$(PWD)/include -Wno-unused-variable -Wno-unused-function -fno-stack-protector
 
 ivc-y := ivc_driver.o
-
+shm-y := shm_driver.o
 .SECONDARY: \
         $(obj)/hivc_template.dtb.S \
         $(obj)/hivc_template.dtb
