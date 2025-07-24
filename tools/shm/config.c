@@ -47,8 +47,8 @@ struct ChannelInfo channel_infos[] =
 {
     { /* 通道1： RootLinux -> NPUcore */
       .channel_id = 1,
-      .irq_req = 1, // SWI1
-      .irq_rsp = 1, // SWI1 // TODO: modify it 
+      .irq_req = 74, // SWI1
+      .irq_rsp = 74, // SWI1 // TODO: modify it 
       .src_zone = LINUX_ZONE_INFO,
       .dst_zone = NPUCORE_ZONE_INFO,
       .src_queue = LINUX_2_NPUCore_MSG_QUEUE_ADDR_INFO,

@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <assert.h>
 #include <stdint.h>
+#include <poll.h>
 
 #include "cJSON.h"
 #include "event_monitor.h"
@@ -21,6 +22,22 @@
 #include "safe_cjson.h"
 #include "virtio.h"
 #include "zone_config.h"
+#include "shm/channel.h"
+#include "shm/msgqueue.h"
+#include "shm/config/config_msgqueue.h"
+#include "shm.h"
+#include <sys/poll.h>
+#include <sys/ioctl.h>
+#include "shm/addr.h"
+#include "shm/config/config_addr.h"
+// Global variables for signal handling
+static volatile int running = 1;
+
+// Signal handler function
+static void signal_handler(int signal) {
+    printf("\nReceived signal %d, shutting down gracefully...\n", signal);
+    running = 0;
+}
 static void __attribute__((noreturn)) help(int exit_status) {
     printf("Hypervisor Management Tool\n\n");
     printf("Usage:\n");
@@ -891,63 +908,172 @@ int general_safe_service_request(struct Client* amp_client,
 
 static int test_shm(char* shm_json_path) {
     parse_global_addr(shm_json_path);
-
+    printf("=== Testing SHM Client ===\n");
     struct Client amp_client = { 0 };
     if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
     {
         printf("client init failed\n");
         while(1) {}
     }
-    // printf("client init success\n");
-    
+    printf("client init success\n");
+    // Add detailed debug info about the client initialization result
+    printf("debug: Client initialization completed, proceeding with memory operations\n");
     struct Msg *msg = client_ops.empty_msg_get(&amp_client, NPUCore_SERVICE_ECHO_ID);
     if (msg == NULL)
     {
         printf("error : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
         return;
     }
-    // printf("info : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
+     printf("info : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
 
-    char data[100] = "hello world";
+    char data[100] = "hello world!!!";
     int data_size = strlen(data);
     int send_count = 1;
     for (int i = 0; i < send_count; i++) {
         msg_ops.msg_reset(msg);
         // TODO: compare to OpenAMP
         // using shared memory
-        char* shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_V);
+        printf("debug: Trying to allocate from persistent block instead...\n");
+        char* shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_P);
+        if (shm_data == NULL)
+        {
+            printf("info: MALLOC_TYPE_P failed, trying MALLOC_TYPE_V with smaller size...\n");
+            shm_data = (char*)client_ops.shm_malloc(&amp_client, 8, MALLOC_TYPE_V);  // Try smaller allocation
+        }
         if (shm_data == NULL)
         {
             printf("error : shm malloc [idx = %d, size = %u, type = %u, ptr = NULL]\n", 
                 i, data_size + 1, MALLOC_TYPE_V);
             return;
         }
-        // printf("info : shm malloc [idx = %d, size = %u, type = %u, ptr = %p]\n", 
-        //     i, data_size + 1, MALLOC_TYPE_V, shm_data);
+         printf("info : shm malloc [idx = %d, size = %u, type = %u, ptr = %p]\n", 
+             i, data_size + 1, MALLOC_TYPE_V, shm_data);
+        // IMMEDIATE test right after allocation
+        printf("debug: IMMEDIATE post-allocation test...\n");
+        volatile char test_char = shm_data[0];  // Read
+        shm_data[0] = 'Z';                      // Write
+        printf("debug: IMMEDIATE test successful - read=0x%02x, wrote='Z'\n", test_char);
+        shm_data[0] = test_char;                // Restore
         
-        int j = 0;
-        for (j = 0; j < data_size; j++)
-        {
+        // Get the actual zone range from the client
+
+        printf("debug: Allocated address: %p\n", shm_data);
+
+        
+        printf("debug: About to write to shm_data=%p, data='%s', data_size=%d, allocated_size=%d\n", 
+            shm_data, data, data_size, data_size + 1);
+        
+        // Try the absolute minimum test first
+        printf("debug: Testing single byte write...\n");
+        char original = shm_data[0];
+        shm_data[0] = 'X';
+        printf("debug: Single byte write successful\n");
+        shm_data[0] = original;  // restore
+        printf("debug: Address range: %p to %p\n", shm_data, shm_data + data_size + 1);
+        
+        // Check page alignment and boundaries
+        uintptr_t addr = (uintptr_t)shm_data;
+        uintptr_t page_size = 4096;  // Assuming 4KB pages
+        uintptr_t page_start = addr & ~(page_size - 1);
+        uintptr_t page_end = page_start + page_size;
+        printf("debug: Page info - addr=0x%lx, page_start=0x%lx, page_end=0x%lx\n", 
+            addr, page_start, page_end);
+        printf("debug: Write will span from 0x%lx to 0x%lx\n", 
+            addr, addr + data_size + 1);
+        
+        if (addr + data_size + 1 > page_end) {
+            printf("debug: WARNING - Write spans across page boundary!\n");
+        }
+        
+        // Test memory access pattern around the allocated region
+        printf("debug: Testing memory access pattern...\n");
+        for (int test_i = 0; test_i < data_size + 2; test_i++) {
+            printf("debug: Testing byte %d at address %p\n", test_i, &shm_data[test_i]);
+            char test_val = shm_data[test_i];  // Read
+            shm_data[test_i] = 'X';            // Write
+            shm_data[test_i] = test_val;       // Restore
+            printf("debug: Byte %d access OK\n", test_i);
+        }
+        
+        // Add a delay to avoid potential race conditions with other zones
+        printf("debug: Adding delay to avoid race conditions...\n");
+        sleep(2);  // Increase delay to 2 seconds
+        
+        // Try simpler approach - avoid any bulk operations
+        printf("debug: Copying data using original logic...\n");
+        int j;
+        for (j = 0; j < data_size; j++) {
             shm_data[j] = data[j];
         }
         shm_data[data_size] = '\0';
+
         
+        // shm_data[data_size] = '\0';
+        // printf("debug: Testing write access to shm_data[0]...\n");
+        
+        // // Test write access to first byte
+        // char original_val = shm_data[0];
+        // shm_data[0] = 'T';
+        // printf("debug: Write test successful, wrote 'T' to shm_data[0]\n");
+        // shm_data[0] = original_val;  // restore
+                
+        // // Test access to last allocated byte
+        // printf("debug: Testing access to last allocated byte [%d]...\n", data_size);
+        // char last_original = shm_data[data_size];
+        // shm_data[data_size] = '\0';
+        // printf("debug: Last byte access successful\n");
+        // shm_data[data_size] = last_original;  // restore
+        // int j = 0;
+        // for (j = 0; j < data_size; j++)
+        // {
+        //     printf("debug: Writing shm_data[%d] = '%c' at address %p\n", j, data[j], &shm_data[j]);
+            
+        //     // Try different write methods to isolate the issue
+        //     if (j == 10) {
+        //         printf("debug: Special handling for index 10...\n");
+        //         printf("debug: Current value at shm_data[10]: 0x%02x\n", (unsigned char)shm_data[10]);
+                
+        //         // Add memory barrier
+        //         __sync_synchronize();
+                
+        //         // Try simple assignment first
+        //         printf("debug: Attempting simple write...\n");
+        //         shm_data[j] = data[j];
+        //         printf("debug: Simple write completed\n");
+                
+        //         // Force cache flush
+        //         __sync_synchronize();
+        //     } else {
+        //         shm_data[j] = data[j];
+        //     }
+        //     // Add small delay and memory barrier after each write
+        //     if (j >= 8) {
+        //         __sync_synchronize();
+        //         usleep(1000); // 1ms delay
+        //     }
+        // }
+        printf("debug: About to call shm_addr_to_offset with shm_data=%p\n", shm_data);
         // printf("shm_data: %s, data_size = %d\n", shm_data, data_size);
         msg->offset = client_ops.shm_addr_to_offset(shm_data);
+        printf("debug: shm_addr_to_offset returned offset=0x%x\n", msg->offset);
+
         msg->length = data_size + 1;
-        // printf("info : msg fill [idx = %d, offset = 0x%x, length = %u]\n", i, msg->offset, msg->length);
+        printf("info : msg fill [idx = %d, offset = 0x%x, length = %u]\n", i, msg->offset, msg->length);
 
         // TODO: check this offset, if necessary ? can't use virtual address?
         
         // send + notify
+        printf("debug: About to call msg_send_and_notify\n");
+
         if (client_ops.msg_send_and_notify(&amp_client, msg) != 0)
         {
             printf("error : msg send [idx = %d, offset = %x, length = %u], check it\n", i, msg->offset, msg->length);
             return;
         }
-        // printf("info : msg send [idx = %d, offset = %x, length = %u]\n", i, msg->offset, msg->length);
+        printf("debug: msg_send_and_notify completed successfully\n");
+        printf("info : msg send [idx = %d, offset = %x, length = %u]\n", i, msg->offset, msg->length);
 
-        // printf("enter polling...\n");
+        printf("enter polling...\n");
         /* 等待消息响应 */
         // client_ops.set_client_request_cnt(&amp_client); // += 1
         // uint32_t request_cnt = client_ops.get_client_request_cnt(&amp_client);
@@ -955,12 +1081,12 @@ static int test_shm(char* shm_json_path) {
             
         // }
         while(client_ops.msg_poll(msg) != 0) {
-            // printf("is polling...\n");
-            // sleep(3);
+            printf("is polling...\n");
+            sleep(3);
         }
         
-        // printf("info : msg result [idx = %d, service_id = %u, result = %u]\n",
-        //        i, msg->service_id, msg->flag.service_result);
+        printf("info : msg result [idx = %d, service_id = %u, result = %u]\n",
+               i, msg->service_id, msg->flag.service_result);
 
         client_ops.shm_free(&amp_client, shm_data);
     }
@@ -975,7 +1101,579 @@ static int check_service_id(uint32_t service_id) {
         return 0;
     }
 }
+// 简化版测试服务端 - 验证共享内存数据读取
+static int test_shm_read(char* shm_json_path) {
+    printf("=== Non-Root Linux SHM Read Test ===\n");
+    printf("Initializing as SHM server to read client data...\n");
+    
+    // step 1: 解析地址配置 (从JSON获取动态地址)
+    parse_global_addr(shm_json_path);
+    printf("[Test] Address configuration parsed\n");
+    
+    // step 2: 映射共享内存地址 (类似 channels_init 中的 mmap)
+    // addr_infos[0] = buf, addr_infos[1] = zone0_msg, addr_infos[2] = zonex_msg
+    
+    // 打开 /dev/mem 来映射物理内存
+    printf("[Test] Opening /dev/mem...\n");
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd < 0) {
+        printf("[Error] Failed to open /dev/mem: %s (errno=%d)\n", strerror(errno), errno);
+        printf("[Info] Make sure you're running as root and /dev/mem is available\n");
+        return -1;
+    }
+    printf("[Test] /dev/mem opened successfully (fd=%d)\n", mem_fd);
+    
+    // 映射缓冲区 (buf)
+    printf("[Test] Mapping buffer: phys=0x%lx, len=0x%x\n", addr_infos[0].start, addr_infos[0].len);
+    void* buf_virt = mmap(NULL, addr_infos[0].len, PROT_READ | PROT_WRITE, 
+                         MAP_SHARED, mem_fd, addr_infos[0].start);
+    if (buf_virt == MAP_FAILED) {
+        printf("[Error] Failed to map buffer memory: %s\n", strerror(errno));
+        close(mem_fd);
+        return -1;
+    }
+    printf("[Test] Buffer mmap successful: %p\n", buf_virt);
+    
+    // 映射消息队列 - 测试：同时映射两个队列来调试
+    printf("[Test] Mapping Non-Root Linux msg queue: phys=0x%lx, len=0x%x\n", addr_infos[2].start, addr_infos[2].len);
+    void* msg_queue_virt = mmap(NULL, addr_infos[2].len, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, mem_fd, addr_infos[2].start);
+    
+    // 同时映射 Root Linux 的队列用于调试
+    printf("[Test] Also mapping Root Linux msg queue for debugging: phys=0x%lx, len=0x%x\n", addr_infos[1].start, addr_infos[1].len);
+    void* root_msg_queue_virt = mmap(NULL, addr_infos[1].len, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, mem_fd, addr_infos[1].start);
+    if (msg_queue_virt == MAP_FAILED) {
+        printf("[Error] Failed to map message queue memory: %s\n", strerror(errno));
+        munmap(buf_virt, addr_infos[0].len);
+        close(mem_fd);
+        return -1;
+    }
+    
+    if (root_msg_queue_virt == MAP_FAILED) {
+        printf("[Error] Failed to map root message queue memory: %s\n", strerror(errno));
+        munmap(buf_virt, addr_infos[0].len);
+        munmap(msg_queue_virt, addr_infos[2].len);
+        close(mem_fd);
+        return -1;
+    }
+    
+    uint64_t buf_addr = (uint64_t)buf_virt;
+    uint64_t msg_queue_addr = (uint64_t)msg_queue_virt;
+    uint64_t root_msg_queue_addr = (uint64_t)root_msg_queue_virt;
+    
+    printf("[Test] Buffer mapped: 0x%lx -> 0x%lx (len: 0x%x)\n", 
+           addr_infos[0].start, buf_addr, addr_infos[0].len);
+    printf("[Test] Non-Root Linux MSG queue mapped: 0x%lx -> 0x%lx (len: 0x%x)\n", 
+           addr_infos[2].start, msg_queue_addr, addr_infos[2].len);
+    printf("[Test] Root Linux MSG queue mapped: 0x%lx -> 0x%lx (len: 0x%x)\n", 
+           addr_infos[1].start, root_msg_queue_addr, addr_infos[1].len);
+    
+    if (msg_queue_addr == 0 || buf_addr == 0 || root_msg_queue_addr == 0) {
+        printf("[Error] Failed to get required addresses\n");
+        return -1;
+    }
+    
+    // step 3: 简单初始化消息队列 (类似 channels_init())
+    printf("[Test] Initializing message queue...\n");
+    struct AmpMsgQueue* msg_queue = (struct AmpMsgQueue*)msg_queue_addr;
+    
+    printf("[Test] Before init - working_mark: 0x%x\n", msg_queue->working_mark);
+    printf("[Test] Current buf_size: %u\n", msg_queue->buf_size);
+    printf("[Test] Current empty_h: %u, wait_h: %u, proc_ing_h: %u\n", 
+           msg_queue->empty_h, msg_queue->wait_h, msg_queue->proc_ing_h);
+    
+    // 设置为已初始化状态 - 这是关键步骤！
+    msg_queue->working_mark = INIT_MARK_INITIALIZED;
+    
+    printf("[Test] After init - working_mark: 0x%x\n", msg_queue->working_mark);
+    printf("[Test] Message queue marked as initialized!\n");
+    
+    // step 4: 显示消息队列状态
+    printf("[Test] Non-Root Linux Message Queue Info:\n");
+    printf("  Buffer size: %u\n", msg_queue->buf_size);
+    printf("  Empty head: %u\n", msg_queue->empty_h);
+    printf("  Wait head: %u\n", msg_queue->wait_h);
+    printf("  Processing head: %u\n", msg_queue->proc_ing_h);
+    
+    // 同时检查 Root Linux 队列状态
+    struct AmpMsgQueue* root_msg_queue = (struct AmpMsgQueue*)root_msg_queue_addr;
+    printf("[Test] Root Linux Message Queue Info:\n");
+    printf("  Working mark: 0x%x\n", root_msg_queue->working_mark);
+    printf("  Buffer size: %u\n", root_msg_queue->buf_size);
+    printf("  Empty head: %u\n", root_msg_queue->empty_h);
+    printf("  Wait head: %u\n", root_msg_queue->wait_h);
+    printf("  Processing head: %u\n", root_msg_queue->proc_ing_h);
+    
+    // step 5: 计算消息实体数组的起始地址 (类似 get_msg_entries_start_addr())
+    uint64_t msg_entries_addr = msg_queue_addr + sizeof(struct AmpMsgQueue);
+    uint64_t root_msg_entries_addr = root_msg_queue_addr + sizeof(struct AmpMsgQueue);
+    printf("[Test] Non-Root message entries start at: 0x%lx\n", msg_entries_addr);
+    printf("[Test] Root message entries start at: 0x%lx\n", root_msg_entries_addr);
+    
+    // step 6: 验证共享缓冲区可访问性 (安全检查)
+    char* test_buf = (char*)buf_addr;
+    printf("[Test] Testing buffer access...\n");
+    printf("[Test] buf_addr = 0x%lx, len = 0x%x\n", buf_addr, addr_infos[0].len);
+    
+    // 更安全的测试 - 先尝试读取，再尝试写入
+    if (buf_addr != 0 && addr_infos[0].len > 100) {
+        printf("[Test] Attempting to read from buffer...\n");
+        volatile char first_byte = test_buf[0];  // 测试读取
+        printf("[Test] First byte read successful: 0x%02x\n", first_byte);
+        
+        printf("[Test] Attempting to write to buffer...\n");
+        test_buf[0] = 'T';  // 测试单字节写入
+        test_buf[1] = 'e';
+        test_buf[2] = 's';
+        test_buf[3] = 't';
+        test_buf[4] = '\0';
+        printf("[Test] Single byte write successful\n");
+        
+        printf("[Test] Buffer test: \"%s\"\n", test_buf);
+    } else {
+        printf("[Test] Buffer access skipped due to safety concerns (addr=0x%lx, len=0x%x)\n", 
+               buf_addr, addr_infos[0].len);
+    }
+    
+    // step 7: 监听并处理消息 (结合中断机制)
+    printf("\n[Test] Waiting for messages from Root Linux...\n");
+    printf("Press Ctrl+C to exit\n");
+    
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    // 打开SHM中断监听设备
+    printf("[Test] Opening /dev/hshm0 for interrupt monitoring...\n");
+    int shm_fd = open("/dev/hshm0", O_RDONLY);
+    if (shm_fd < 0) {
+        printf("[Warning] Failed to open /dev/hshm0: %s\n", strerror(errno));
+        printf("[Info] Will use polling mode instead of interrupt mode\n");
+    } else {
+        printf("[Test] /dev/hshm0 opened successfully for interrupt monitoring\n");
+    }
+    
+    struct pollfd pfd;
+    if (shm_fd >= 0) {
+        pfd.fd = shm_fd;
+        pfd.events = POLLIN;
+    }
+    
+    int msg_count = 0;
+    int check_counter = 0;
+    
+    while (running && msg_count < 10) {
+        bool should_check_messages = false;
+        
+        // 如果有中断设备，先检查中断
+        if (shm_fd >= 0) {
+            int ret = poll(&pfd, 1, 100); // 100ms超时
+            if (ret > 0 && (pfd.revents & POLLIN)) {
+                printf("[Test] SHM interrupt received, checking for messages...\n");
+                should_check_messages = true;
+                
+                // 读取中断信息
+                shm_signal_info_t signal_info;
+                if (ioctl(shm_fd, HVISOR_SHM_SIGNAL_INFO, &signal_info) == 0) {
+                    printf("[Test] Signal count: %u, cpu: %u, service_id: %u\n", 
+                           signal_info.signal_count, signal_info.current_cpu, signal_info.last_service_id);
+                }
+            }
+        }
+        
+        // 定期检查或中断触发检查
+        if (should_check_messages || (++check_counter % 10 == 0)) {
+            // 首先检查 Non-Root Linux 自己的队列
+            bool found_message = false;
+            
+            if (msg_queue->proc_ing_h < msg_queue->buf_size) {
+                printf("\n[Test] *** MESSAGE DETECTED IN NON-ROOT QUEUE *** Processing message #%d\n", ++msg_count);
+                found_message = true;
+                
+                // 处理 Non-Root 队列消息的逻辑...
+                // (保留原有逻辑)
+            }
+            
+            // 关键修改：检查并处理 Root Linux 队列中的消息
+            if (!found_message && root_msg_queue->proc_ing_h < root_msg_queue->buf_size) {
+                printf("\n[Test] *** PROCESSING MESSAGE FROM ROOT LINUX QUEUE *** Message #%d\n", ++msg_count);
+                found_message = true;
+                
+                // 处理 Root Linux 队列中的消息
+                uint16_t head = root_msg_queue->proc_ing_h;
+                uint16_t msg_index = head;
+                
+                // 计算当前消息实体的地址
+                uint64_t msg_entry_addr = root_msg_entries_addr + sizeof(struct MsgEntry) * head;
+                struct MsgEntry* msg_entry = (struct MsgEntry*)msg_entry_addr;
+                struct Msg* msg = &msg_entry->msg;
+                
+                printf("  Root Message details:\n");
+                printf("    Index: %u\n", msg_index);
+                printf("    Service ID: %u\n", msg->service_id);
+                printf("    Offset: 0x%x\n", msg->offset);
+                printf("    Length: %u\n", msg->length);
+                printf("    Deal state: %u\n", msg->flag.deal_state);
+                
+                // 从共享内存读取数据
+                if (msg->length > 0) {
+                    char* data_ptr = (char*)(buf_addr + msg->offset);
+                    printf("    Reading from buf_addr=0x%lx + offset=0x%x = 0x%lx\n", 
+                           buf_addr, msg->offset, (uint64_t)data_ptr);
+                    // 安全地显示数据内容 - 逐字节打印
+                    printf("    *** DATA FROM ROOT LINUX: [");
+                    for (int i = 0; i < msg->length && i < 32; i++) {  // 最多显示32字节
+                        if (data_ptr[i] >= 32 && data_ptr[i] <= 126) {  // 可打印字符
+                            printf("%c", data_ptr[i]);
+                        } else {
+                            printf("\\x%02x", (unsigned char)data_ptr[i]);
+                        }
+                    }
+                    if (msg->length > 32) printf("...");
+                    printf("] (%u bytes) ***\n", msg->length);                    
+                    // 处理数据
+                    printf("    Processing data...\n");
+                    
+                    // 标记消息已处理 - 这是关键步骤！
+                    printf("    Setting deal_state to MSG_DEAL_STATE_YES...\n");
+                    msg->flag.deal_state = MSG_DEAL_STATE_YES;
+                    msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                    
+                    printf("    *** MESSAGE PROCESSED SUCCESSFULLY! ***\n");
+                    printf("    Root Linux should now detect completion and stop polling\n");
+                } else {
+                    printf("    No data to read (length=%u)\n", msg->length);
+                    msg->flag.deal_state = MSG_DEAL_STATE_YES;
+                    msg->flag.service_result = MSG_SERVICE_RET_FAIL;
+                }
+                
+                // 更新 Root Linux 队列头
+                uint16_t new_head = msg_entry->nxt_idx;
+                root_msg_queue->proc_ing_h = new_head;
+                msg_entry->nxt_idx = root_msg_queue->buf_size; // 标记为无效
+                
+                printf("    Updated Root Linux proc_ing_h: %u -> %u\n", head, new_head);
+                printf("    Root Linux should now detect the state change and stop polling\n");
+            }
+            if (!found_message && check_counter % 50 == 0) {
+                // 每5秒显示一次等待状态
+                printf("[Test] Still waiting for messages... (Non-Root proc_ing_h=%u, Root proc_ing_h=%u)\n", 
+                       msg_queue->proc_ing_h, root_msg_queue->proc_ing_h);
+            }
+        }
+        
+        usleep(100000); // 100ms
+    }
+    
+    printf("\n[Test] SHM read test completed. Processed %d messages.\n", msg_count);
+    
+    // step 8: 清理资源
+    if (shm_fd >= 0) {
+        close(shm_fd);
+        printf("[Test] Closed /dev/hshm0\n");
+    }
+    munmap((void*)buf_addr, addr_infos[0].len);
+    munmap((void*)msg_queue_addr, addr_infos[2].len);
+    munmap((void*)root_msg_queue_addr, addr_infos[1].len);
+    close(mem_fd);
+    
+    return 0;
+}
 
+// Non-root Linux 服务端实现 - 处理来自 root Linux 的安全服务请求
+static int shm_server(char* shm_json_path) {
+    printf("=== Non-Root Linux SHM Server ===\n");
+    printf("Initializing SHM server to handle requests from Root Linux...\n");
+    
+    // step 1: 解析配置并初始化地址信息
+    parse_global_addr(shm_json_path);
+    printf("[Server] Address configuration parsed\n");
+    
+    // step 2: 初始化通道（作为接收端）
+    if (channel_ops.channels_init() != 0) {
+        printf("[Error] Failed to initialize channels\n");
+        return -1;
+    }
+    printf("[Server] Channels initialized\n");
+    
+    // step 3: 获取用于接收消息的通道（从Root Linux到当前zone）
+    struct Channel* receive_channel = channel_ops.target_channel_get(ZONE_LINUX_ID);
+    if (receive_channel == NULL) {
+        printf("[Error] Failed to get receive channel from Root Linux\n");
+        return -1;
+    }
+    printf("[Server] Receive channel obtained\n");
+    
+    // step 4: 初始化共享内存管理
+    struct Client server_client = {0};
+    if (client_ops.client_init(&server_client, ZONE_LINUX_ID) != 0) {
+        printf("[Error] Failed to initialize server client\n");
+        return -1;
+    }
+    printf("[Server] Server client initialized\n");
+    
+    // step 5: 检查消息队列是否就绪
+    if (channel_ops.channel_is_ready(receive_channel) != 0) {
+        printf("[Error] Channel is not ready\n");
+        return -1;
+    }
+    printf("[Server] Channel is ready, waiting for messages...\n");
+    
+    // step 6: 主循环 - 处理消息
+    int processed_count = 0;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    while (running) {
+        // 检查消息队列是否有待处理的消息
+        if (receive_channel->msg_queue->proc_ing_h >= receive_channel->msg_queue->buf_size) {
+            // 没有待处理的消息，短暂休眠
+            usleep(1000); // 1ms
+            continue;
+        }
+        
+        // step 7: 从处理队列中取出消息
+        uint16_t msg_index = msg_queue_ops.pop(receive_channel->msg_queue, 
+                                             &receive_channel->msg_queue->proc_ing_h);
+        
+        if (msg_index >= receive_channel->msg_queue->buf_size) {
+            // 队列为空，继续等待
+            usleep(1000);
+            continue;
+        }
+        
+        // step 8: 获取消息对象
+        struct MsgEntry* msg_entry = &receive_channel->msg_queue->entries[msg_index];
+        struct Msg* msg = &msg_entry->msg;
+        
+        printf("\n[Server] Processing message #%d:\n", ++processed_count);
+        printf("  Service ID: %u\n", msg->service_id);
+        printf("  Offset: 0x%x\n", msg->offset);
+        printf("  Length: %u\n", msg->length);
+        printf("  Deal State: %u\n", msg->flag.deal_state);
+        
+        // step 9: 从共享内存读取数据
+        void* shm_data = client_ops.shm_offset_to_addr(msg->offset);
+        if (shm_data == NULL) {
+            printf("[Error] Failed to get shared memory data\n");
+            msg->flag.service_result = MSG_SERVICE_RET_FAIL;
+            msg->flag.deal_state = MSG_DEAL_STATE_YES;
+            continue;
+        }
+        
+        char* input_data = (char*)shm_data;
+        printf("  Input Data: \"%s\"\n", input_data);
+        
+        // step 10: 根据 service_id 处理请求
+        switch (msg->service_id) {
+            case NPUCore_SERVICE_ECHO_ID:
+                // Echo 服务 - 直接返回原数据（测试用）
+                printf("  Processing ECHO service\n");
+                // 数据已经在共享内存中，无需修改
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_FLIP_ID:
+                // 翻转字符串服务
+                printf("  Processing FLIP service\n");
+                int len = strlen(input_data);
+                for (int i = 0; i < len / 2; i++) {
+                    char temp = input_data[i];
+                    input_data[i] = input_data[len - 1 - i];
+                    input_data[len - 1 - i] = temp;
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_CAESAR_ENCRYPT_ID:
+                // Caesar 加密（简单位移3）
+                printf("  Processing CAESAR ENCRYPT service\n");
+                len = strlen(input_data);
+                for (int i = 0; i < len; i++) {
+                    if (input_data[i] >= 'a' && input_data[i] <= 'z') {
+                        input_data[i] = ((input_data[i] - 'a' + 3) % 26) + 'a';
+                    } else if (input_data[i] >= 'A' && input_data[i] <= 'Z') {
+                        input_data[i] = ((input_data[i] - 'A' + 3) % 26) + 'A';
+                    }
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_CAESAR_DECRYPT_ID:
+                // Caesar 解密（反向位移3）
+                printf("  Processing CAESAR DECRYPT service\n");
+                len = strlen(input_data);
+                for (int i = 0; i < len; i++) {
+                    if (input_data[i] >= 'a' && input_data[i] <= 'z') {
+                        input_data[i] = ((input_data[i] - 'a' - 3 + 26) % 26) + 'a';
+                    } else if (input_data[i] >= 'A' && input_data[i] <= 'Z') {
+                        input_data[i] = ((input_data[i] - 'A' - 3 + 26) % 26) + 'A';
+                    }
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+            case NPUCore_SERVICE_XOR_ENCRYPT_ID:
+            case NPUCore_SERVICE_XOR_DECRYPT_ID:
+                // XOR 加密/解密（使用密钥0x42）
+                printf("  Processing XOR ENCRYPT/DECRYPT service\n");
+                len = strlen(input_data);
+                for (int i = 0; i < len; i++) {
+                    input_data[i] ^= 0x42;
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_ROT13_ENCRYPT_ID:
+            case NPUCore_SERVICE_ROT13_DECRYPT_ID:
+                // ROT13 加密/解密
+                printf("  Processing ROT13 ENCRYPT/DECRYPT service\n");
+                len = strlen(input_data);
+                for (int i = 0; i < len; i++) {
+                    if (input_data[i] >= 'a' && input_data[i] <= 'z') {
+                        input_data[i] = ((input_data[i] - 'a' + 13) % 26) + 'a';
+                    } else if (input_data[i] >= 'A' && input_data[i] <= 'Z') {
+                        input_data[i] = ((input_data[i] - 'A' + 13) % 26) + 'A';
+                    }
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_DJB2_HASH_ID:
+                // DJB2 哈希
+                printf("  Processing DJB2 HASH service\n");
+                {
+                    unsigned long hash = 5381;
+                    int c;
+                    char* str = input_data;
+                    while ((c = *str++)) {
+                        hash = ((hash << 5) + hash) + c;
+                    }
+                    snprintf(input_data, msg->length, "%lu", hash);
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_CRC32_HASH_ID:
+                // 简单CRC32哈希
+                printf("  Processing CRC32 HASH service\n");
+                {
+                    unsigned int crc = 0xFFFFFFFF;
+                    char* str = input_data;
+                    while (*str) {
+                        crc ^= *str++;
+                        for (int j = 0; j < 8; j++) {
+                            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+                        }
+                    }
+                    snprintf(input_data, msg->length, "%08X", crc ^ 0xFFFFFFFF);
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_FNV_HASH_ID:
+                // FNV哈希
+                printf("  Processing FNV HASH service\n");
+                {
+                    unsigned int hash = 2166136261U;
+                    char* str = input_data;
+                    while (*str) {
+                        hash ^= *str++;
+                        hash *= 16777619;
+                    }
+                    snprintf(input_data, msg->length, "%08X", hash);
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_XORSHIFT_RAND_NUMBER_ID:
+                // XORSHIFT随机数生成
+                printf("  Processing XORSHIFT RANDOM service\n");
+                {
+                    static uint32_t state = 1;
+                    if (state == 1) state = 123456789; // 初始种子
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    snprintf(input_data, msg->length, "%u", state);
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_LCG_RAND_NUMBER_ID:
+                // LCG随机数生成
+                printf("  Processing LCG RANDOM service\n");
+                {
+                    static uint32_t state = 1;
+                    state = (state * 1103515245 + 12345) & 0x7fffffff;
+                    snprintf(input_data, msg->length, "%u", state);
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_RAND_STRING_ID:
+                // 随机字符串生成
+                printf("  Processing RANDOM STRING service\n");
+                {
+                    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                    static uint32_t state = 12345;
+                    int len = msg->length - 1;
+                    if (len > 63) len = 63; // 限制长度
+                    for (int i = 0; i < len; i++) {
+                        state = (state * 1103515245 + 12345) & 0x7fffffff;
+                        input_data[i] = charset[state % (sizeof(charset) - 1)];
+                    }
+                    input_data[len] = '\0';
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+            case NPUCore_SERVICE_RAND_CHAR_ID:
+                // 随机字符生成
+                printf("  Processing RANDOM CHAR service\n");
+                {
+                    static uint32_t state = 54321;
+                    state = (state * 1103515245 + 12345) & 0x7fffffff;
+                    char rand_char = 'A' + (state % 26);
+                    snprintf(input_data, msg->length, "%c", rand_char);
+                }
+                msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                break;
+                
+                
+            default:
+                printf("  Unknown service ID: %u\n", msg->service_id);
+                msg->flag.service_result = MSG_SERVICE_RET_NOT_EXITS;
+                break;
+        }
+        
+        // step 11: 标记消息已处理
+        msg->flag.deal_state = MSG_DEAL_STATE_YES;
+        
+        printf("  Result: %s\n", input_data);
+        printf("  Service Result: %u\n", msg->flag.service_result);
+        printf("  Message processed successfully\n");
+        
+        // step 12: 将消息移回空闲队列
+        if (msg_queue_ops.push(receive_channel->msg_queue, 
+                              &receive_channel->msg_queue->empty_h, msg_index) != 0) {
+            printf("[Error] Failed to return message to empty queue\n");
+        }
+        
+        // step 13: 检查是否所有消息都处理完成
+        if (receive_channel->msg_queue->proc_ing_h >= receive_channel->msg_queue->buf_size) {
+            // 所有消息处理完成，标记队列为空闲状态
+            receive_channel->msg_queue->working_mark = MSG_QUEUE_MARK_IDLE;
+            printf("[Server] All messages processed, queue marked as IDLE\n");
+        }
+    }
+    
+    // step 14: 清理资源
+    client_ops.client_destory(&server_client);
+    printf("\n[Server] SHM server shutting down\n");
+    printf("Total messages processed: %d\n", processed_count);
+    
+    return 0;
+}
 static int safe_service(int argc, char *argv[]) {
     // service_id data data_size
     if (argc != 4) {
@@ -1245,16 +1943,8 @@ int test(int argc, char *argv[]) {
     return 0;
 }
 
-#include "shm.h"
-#include <sys/poll.h>
-#include <sys/ioctl.h>
-static volatile int running = 1;
 
-void signal_handler(int sig)
-{
-    printf("Received signal %d, exiting...\n", sig);
-    running = 0;
-}
+
 
 void print_timestamp(uint64_t ns)
 {
@@ -1422,6 +2112,24 @@ int main(int argc, char *argv[]) {
         else if(strcmp(argv[2], "receiver") == 0) {
             // hvisor shm receiver 
             shm_receiver();
+        }
+        else if(strcmp(argv[2], "server") == 0) {
+            // hvisor shm server <shm_json_path>
+            if (argc < 4) {
+                printf("Usage: hvisor shm server <shm_json_path>\n");
+                printf("Example: hvisor shm server /path/to/shm_config.json\n");
+                help(1);
+            }
+            shm_server(argv[3]);
+        }
+        else if(strcmp(argv[2], "test_read") == 0) {
+            // hvisor shm test_read <shm_json_path>
+            if (argc < 4) {
+                printf("Usage: hvisor shm test_read <shm_json_path>\n");
+                printf("Example: hvisor shm test_read /path/to/shm_config.json\n");
+                help(1);
+            }
+            test_shm_read(argv[3]);
         }
         else {
             help(1);

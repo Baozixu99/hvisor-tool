@@ -3,7 +3,12 @@
 #include "shm/config/config_msgqueue.h"
 #include "shm/msgqueue.h"
 #include <stdio.h>
-
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <unistd.h>
+#include "shm/config/config_zone.h"
 static int set_r21_zero(void) {
   // asm volatile("move $r21, $zero");
   asm volatile("mov x18, xzr" : : : "x18");//arm架构为x18
@@ -56,12 +61,74 @@ static int32_t client_init(struct Client* raw_client, uint32_t remote_zone_id)
     // printf("client_init_info: get target channel success = %u\n",remote_zone_id);
   }
 
-  while (channel_ops.channel_is_ready(target_channel) != 0) 
+  printf("Waiting for channel %u to be ready...\n", remote_zone_id);
+  
+  // 特殊处理：Root Linux 需要检查 Non-Root Linux 的消息队列状态
+  void* dst_queue_virt = NULL;
+  int mem_fd = -1;
+  if (remote_zone_id == ZONE_NPUcore_ID) {
+      // 映射目标zone的消息队列地址来检查状态
+      mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+      if (mem_fd >= 0) {
+          // 映射 Non-Root Linux 的消息队列 (addr_infos[2] = zonex_ram_ipa)
+          dst_queue_virt = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, mem_fd, 0xde410000);  // zonex_ram_ipa
+          if (dst_queue_virt != MAP_FAILED) {
+              printf("Mapped target zone queue at: %p\n", dst_queue_virt);
+          } else {
+              dst_queue_virt = NULL;
+          }
+      }
+  }
+  
+  int retry_count = 0;
+  while (1) 
   /* 检查目标通道是否已经被启用 */
   {
-      // printf("channel is ready????\n");
-      // sleep(3);
+      int channel_ready = 0;
+      
+      if (dst_queue_virt != NULL) {
+          // 检查目标zone的消息队列状态
+          struct AmpMsgQueue* dst_queue = (struct AmpMsgQueue*)dst_queue_virt;
+          printf("Checking target zone queue: working_mark=0x%x\n", dst_queue->working_mark);
+          
+          if (dst_queue->working_mark == INIT_MARK_INITIALIZED || 
+              dst_queue->working_mark == MSG_QUEUE_MARK_IDLE) {
+              channel_ready = 1;
+          }
+      } else {
+          // 回退到原来的检查方式
+          if (channel_ops.channel_is_ready(target_channel) == 0) {
+              channel_ready = 1;
+          }
+      }
+      
+      if (channel_ready) {
+          break;
+      }
+      
+      if (retry_count == 0) {
+          printf("Channel not ready, waiting for Non-Root Linux initialization...\n");
+      }
+      
+      retry_count++;
+      if (retry_count > 10) {
+          printf("Timeout waiting for channel readiness after %d retries\n", retry_count);
+          break;
+      }
+      
+      sleep(1);
   }
+  
+  // 清理临时映射
+  if (dst_queue_virt != NULL) {
+      munmap(dst_queue_virt, 0x1000);
+  }
+  if (mem_fd >= 0) {
+      close(mem_fd);
+  }
+  
+  printf("Channel %u is ready!\n", remote_zone_id);
   // printf("client_init_info: target channel [%u] is ready\n", remote_zone_id);
   
   
@@ -167,7 +234,7 @@ static int32_t client_msg_send(struct Client* client, struct Msg* full_msg)
 
 static int32_t client_msg_send_and_notify(struct Client* client, struct Msg* full_msg)
 { 
-  // printf("client msg send and notify enter\n");
+  printf("client msg send and notify enter\n");
   ASSERT(client != NULL);
   ASSERT(full_msg != NULL);
 

@@ -5,10 +5,10 @@
 #include "config_common.h"
 
 #define ZONE_LINUX_ID     (0U)  /* Root Linux */
-#define ZONE_LINUX_NAME     "Root-Linux"
+#define ZONE_LINUX_NAME     "root-linux"
 
 #define ZONE_NPUcore_ID   (1U)  /* NPUcore */
-#define ZONE_NPUcore_NAME   "NPUcore"
+#define ZONE_NPUcore_NAME   "linux2"
 
 #define ZONE_RT_Thread_ID (2U)  /* RT-Thread */
 #define ZONE_RT_Thread_NAME "RT-Thread"

@@ -50,32 +50,32 @@ static int open_hvisor_dev() {
 static channel_request(__u64 target_zone_id,
     __u64 service_id, __u64 swi) {
     // ASSERT(swi == 0 || 1)
-    
-    // shm_args_t args;
-    // args.target_zone_id = target_zone_id;
-    // args.service_id = service_id;
-    // args.swi = swi;
+    shm_args_t args;
+    args.target_zone_id = target_zone_id;
+    args.service_id = service_id;
+    args.swi = swi;
+    printf("debug:args.target_zone_id = %ld,args.service_id = %ld,args.swi = %ld\n",args.target_zone_id,args.service_id,args.swi);
 
-    // int fd = open_hvisor_dev();
-    // int ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
-    // if (ret < 0) {
-    //     perror("end_exception_trace: ioctl failed");
-    // }
+    int fd = open_hvisor_dev();
+    int ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
+    if (ret < 0) {
+        perror("end_exception_trace: ioctl failed");
+    }
 
 
     // hypercall directly from Guest-PLV3 to Host-PLV0,
     // instead of Guest-PLV3 -> Guest-PLV0 -> Host-PLV0
-    int ret = hvisor_call(HVISOR_SHM_SIGNAL, target_zone_id, 
-        service_id);// service_id is not used now, actually
-    if (ret < 0) {
-        printf("hvisor: failed to do shm signal\n");
-        while(1) {}
-    }
+    // int ret = hvisor_call(HVISOR_SHM_SIGNAL, target_zone_id, 
+    //     service_id);// service_id is not used now, actually
+    // if (ret < 0) {
+    //     printf("hvisor: failed to do shm signal\n");
+    //     while(1) {}
+    // }
 }
 
 int32_t channels_init(void)
 {
-    // printf("channels_init\n");
+    printf("channels_init\n");
     // TODO: add channel mutex init
 
     // if (channel_init_mark == INIT_MARK_INITIALIZED)
@@ -121,19 +121,17 @@ int32_t channels_init(void)
 
         // printf("step3\n");
 
-        // printf("self_zone_id : %d\n", self_zone_id);
-
-        // channel->channel_info;
-        // printf("step 3.1\n");
-        // channel->channel_info->src_zone;
-        // printf("step 3.2\n");
-        // channel->channel_info->src_zone->id;
-        // printf("step 3.3\n");
+    printf("self_zone_id: %d | channel_id: %d | src_zone_id: %d | dst_zone_id: %d | irq_req: %d | irq_rsp: %d\n",
+       self_zone_id,
+       channel->channel_info->channel_id,
+       channel->channel_info->src_zone->id,
+       channel->channel_info->dst_zone->id,
+       channel->channel_info->irq_req,
+       channel->channel_info->irq_rsp);
 
         if (self_zone_id ==
             channel->channel_info->src_zone->id) /* 该通道起点是本zone */
         {
-            // printf("step4\n");
             if (channel->channel_info->src_queue->start == 0) {
                 printf("channels_init_error: src_queue start is 0, check it\n");
                 while (1) {
@@ -155,18 +153,16 @@ int32_t channels_init(void)
 
                 goto mmap_err;
             }
-
             // important! don't forget to init the msg queue
             if (msg_queue_ops.init(channel->msg_queue, channel->channel_info->src_queue->len) != 0) {
 				printf("channels msg_queue_init error: msg_queue_init fail, check it\n");
                 while(1) {}
             }
-        
-            // printf("channels_init_info: src msg_queue mmap = %p, mem_fd = %d, "
-            //        "origin_start = %lx, length = %u\n",
-            //        channel->msg_queue, mem_fd,
-            //        channel->channel_info->src_queue->start,
-            //        channel->channel_info->src_queue->len);
+            printf("channels_init_info: src msg_queue mmap = %p, mem_fd = %d, "
+                   "origin_start = %lx, length = %u\n",
+                   channel->msg_queue, mem_fd,
+                   channel->channel_info->src_queue->start,
+                   channel->channel_info->src_queue->len);
 
             /* 映射消息队列互斥体 */
             //  TODO: add mutex map and init ?
@@ -234,7 +230,7 @@ int32_t channels_init(void)
     
 
     // TODO: release lock;
-    // printf("channels_init_success: init channel success\n");
+    printf("channels_init_success: init channel success\n");
     return 0;
 
 mmap_err:
@@ -352,7 +348,7 @@ static int32_t channel_notify(struct Channel* channel)
 	/* 向可以触发核间中断的寄存器中写入数据以触发核间中断 */
 	// *(channel->reg_msg) = 1U;
 
-    channel_request(channel->channel_info->dst_zone->id, 0, 1);// service_id is not important
+    channel_request(channel->channel_info->dst_zone->id, 0, 74);// service_id is not important
 
 	return 0;
 }
@@ -419,7 +415,7 @@ static int32_t channel_msg_send(struct Channel* channel,struct Msg* msg)
 
 static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* msg)
 {
-    // printf("channel_msg_send_and_notify\n");
+    printf("channel_msg_send_and_notify\n");
 
     struct MsgEntry* entry = (struct MsgEntry*)msg;
     int ret = -1;
@@ -429,7 +425,7 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
     ret = msg_queue_ops.push(channel->msg_queue, &channel->msg_queue->wait_h,
                              entry->cur_idx);
 
-    // printf("msg_send_and_notify: msg_queue_ops.push ret = %d\n", ret);
+    printf("msg_send_and_notify: msg_queue_ops.push ret = %d\n", ret);
     if (ret == 0) {
         channel->msg_queue_mutex->msg_wait_cnt++;
     } else {
@@ -438,12 +434,12 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
         while(1) {}
     }
 
-    // printf("msg_send_and_notify: msg_wait_cnt = %u\n", channel->msg_queue_mutex->msg_wait_cnt);
+    printf("msg_send_and_notify: msg_wait_cnt = %u\n", channel->msg_queue_mutex->msg_wait_cnt);
 
     if (channel->msg_queue_mutex->msg_wait_cnt == 0) /* 没有需要处理的消息 */
 	{
 		byte_flag_ops.unlock(&channel->msg_queue_mutex->wait_lock);
-		// printf("msg_send_and_notify: have no wait msg\n");
+		printf("msg_send_and_notify: have no wait msg\n");
 		return 0;
 	}
 
@@ -452,8 +448,8 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
 	while (channel->msg_queue->working_mark != MSG_QUEUE_MARK_IDLE) 
     /* 等待远程Zone处理完上一批消息 */
 	{ 
-        // printf("wait for msg_queue_mark == MSG_QUEUE_MARK_IDLE, %lx\n", channel->msg_queue->working_mark);
-        // sleep(5);
+        printf("wait for msg_queue_mark == MSG_QUEUE_MARK_IDLE, %lx\n", channel->msg_queue->working_mark);
+        sleep(5);
     }
 
     // printf("msg_send_and_notify: remote idel, prepare to notify, msg_queue_mark = %x\n", 
@@ -476,7 +472,8 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
 	byte_flag_ops.unlock(&channel->msg_queue_mutex->wait_lock);
  
     // printf("dst_zone_id = %u, service_id = %u\n", channel->channel_info->dst_zone->id, msg->service_id);
-    channel_request(channel->channel_info->dst_zone->id, msg->service_id, 1);
+    //arm swi = 74
+    channel_request(channel->channel_info->dst_zone->id, msg->service_id, 74);
 
     // TODO: add a inter-zone mutex lock and unlock (autually, wait_lock is just enough!)
     // client_ops.set_client_request_cnt(amp_client); // += 1

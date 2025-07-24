@@ -14,6 +14,7 @@
 #include "shm/config/config_addr.h"
 #include "shm/shm.h"
 #include "hvisor.h"
+#include <errno.h>
 
 // TODO: add a mutex to protect shm init process (shm_init_mark)
 static struct Shm shm = {0}; /* 共享内存管理信息 */
@@ -71,6 +72,11 @@ static uint64_t malloc_from_volatile_block(int start_index, int end_index, int s
 static uint64_t shm_addr_to_offset(void* ptr)
 {
     // printf("shm_addr_to_offset\n");
+    printf("shm_addr_to_offset: called with ptr=%p\n", ptr);
+    printf("shm_addr_to_offset: zone_start=%p, zone_len=0x%x\n", 
+        shm.shm_zone_start, shm.shm_cfg->zone_shm->len);
+    printf("shm_addr_to_offset: zone_end=%p\n", 
+        (void*)(shm.shm_zone_start + shm.shm_cfg->zone_shm->len));
 
     if (ptr < shm.shm_zone_start || ptr > shm.shm_zone_start + shm.shm_cfg->zone_shm->len)
     {
@@ -78,7 +84,11 @@ static uint64_t shm_addr_to_offset(void* ptr)
             ptr, shm.shm_zone_start, (void*)(shm.shm_zone_start + shm.shm_cfg->zone_shm->len));
         while(1) {}
     }
-    return ptr - shm.shm_zone_start;
+    // return ptr - shm.shm_zone_start;
+        
+    uint64_t offset = ptr - shm.shm_zone_start;
+    printf("shm_addr_to_offset: calculated offset=0x%lx\n", offset);
+    return offset;
 }
 
 static void* shm_offset_to_addr(uint32_t offset)
@@ -192,19 +202,28 @@ static int32_t shm_init(void)
 	    printf("shm_init_error: mmap shm manage info fail\n");
         while(1) {}
     }
-
-    // printf("shm_init_info: mmap shm manage info success [shm_infos_pa = %p, shm_infos_va = %p]\n", 
-    //     (void*)shm_infos_pa, shm.shm_infos);
+    printf("shm_init_info: virtual addr [zone_start = %p, zone_end = %p]\n", 
+        shm.shm_zone_start, (void*)(shm.shm_zone_start + zone_shm_length));
+    printf("shm_init_info: mmap shm manage info success [shm_infos_pa = %p, shm_infos_va = %p]\n", 
+        (void*)shm_infos_pa, shm.shm_infos);
 
     /* 映射出内核中的管理信息块 */
+    printf("shm_init_debug: mapping zone_shm_start=0x%lx, length=0x%x\n", zone_shm_start, zone_shm_length);
     shm.shm_zone_start = mmap(NULL, zone_shm_length, PROT_READ | PROT_WRITE, 
         MAP_SHARED, mem_fd, zone_shm_start);
+    printf("shm_init_debug: mmap returned %p, MAP_FAILED=%p\n", shm.shm_zone_start, MAP_FAILED);
 
-    if (shm.shm_zone_start == NULL)
+    if (shm.shm_zone_start == MAP_FAILED)
+
     {
         // shm_init_mark = INIT_MARK_DESTORYED;
         // TODO: release the mutex
-        printf("shm_init_error: mmap shm fail\n");
+        printf("shm_init_error: mmap shm fail, errno=%d\n", errno);
+        while(1) {}
+    }
+    if (shm.shm_zone_start == NULL)
+    {
+        printf("shm_init_error: mmap returned NULL, errno=%d\n", errno);
         while(1) {}
     }
     // printf("shm_init_info: virtual addr [zone_start = %p, zone_end = %p]\n", 
@@ -388,6 +407,9 @@ static int32_t shm_init(void)
     // shm_init_mark = INIT_MARK_INITIALIZED; 
     // TODO: release the mutex
     // printf("shm_init_success: init shm success\n");
+    printf("shm_init_success: init shm success\n");
+    printf("shm_init_summary: zone_start=%p, zone_length=0x%x, pblock_size=0x%x, vblock_size=0x%x\n",
+        shm.shm_zone_start, zone_shm_length, shm.shm_cfg->pblock_size, shm.shm_cfg->vblock_size);
     return 0;
 }
 
@@ -399,10 +421,13 @@ static void* shm_malloc(uint32_t size, enum MallocType type)
     //     printf("shm_malloc_error: init shm before use\n");
     //     while(1) {}
     // }
+    uint32_t original_size = size;
 
     /* 按照配置信息进行字节对齐 */
     size = (size + shm.shm_cfg->bit_align -1) & (~(shm.shm_cfg->bit_align - 1));
-
+    
+    printf("shm_malloc_debug: size alignment [original=%d, aligned=%d, bit_align=%d]\n", 
+        original_size, size, shm.shm_cfg->bit_align);
     switch (type)
     {
         case MALLOC_TYPE_P:
@@ -416,6 +441,11 @@ static void* shm_malloc(uint32_t size, enum MallocType type)
                 return NULL;
             }
             void* result = shm.shm_zone_start + shm.shm_infos->pblock_info.next_alloc_offset; /* 记录下需要返回的地址 */
+
+            printf("shm_malloc_debug: MALLOC_TYPE_P [zone_start=%p, offset=%d, final_addr=%p, size=%d]\n",
+                shm.shm_zone_start, shm.shm_infos->pblock_info.next_alloc_offset, result, size);
+            printf("shm_malloc_debug: pblock info [next_alloc_offset=%d, available_size=%d]\n",
+                shm.shm_infos->pblock_info.next_alloc_offset, shm.shm_infos->pblock_info.available_size);
             shm.shm_infos->pblock_info.available_size -= size; /* 减去已经被分配的空间大小 */
             shm.shm_infos->pblock_info.next_alloc_offset += size; /* 将待分配地址指向下一个位置 */
 
@@ -447,7 +477,22 @@ static void* shm_malloc(uint32_t size, enum MallocType type)
             // printf("shm_malloc_success: MALLOC_TYPE_V [start address: %p, length = %d B]\n", 
             //     shm.shm_zone_start + result, size);
 
-            return shm.shm_zone_start + result;
+            // return shm.shm_zone_start + result;
+            void* final_addr = shm.shm_zone_start + result;
+            printf("shm_malloc_debug: MALLOC_TYPE_V [zone_start=%p, offset=%d, final_addr=%p, size=%d]\n", 
+                shm.shm_zone_start, result, final_addr, size);
+            // Additional debug info for volatile block allocation
+            printf("shm_malloc_debug: volatile block details [current_block=%d, result_offset=%d]\n",
+                shm.shm_infos->vblock_current, result);
+            if (shm.shm_infos->vblock_current < SHM_VBLOCK_CNT) {
+                int current_block = shm.shm_infos->vblock_current;
+                printf("shm_malloc_debug: block[%d] info [start_offset=%d, available_size=%d, total_length=%d]\n",
+                    current_block,
+                    shm.shm_infos->vblock_infos[current_block].alloc_start_offset,
+                    shm.shm_infos->vblock_infos[current_block].available_size,
+                    shm.shm_infos->vblock_infos[current_block].total_length);
+            }
+            return final_addr;
         }
         default:
         {
