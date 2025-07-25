@@ -109,7 +109,7 @@ static int hvisor_shm_signal_info(shm_signal_info_t __user *sinfo) {
     uint64_t latest_timestamp = 0;
     uint32_t latest_service_id = 0;
     
-    // 汇总所有 IVC 设备的 SHM 信号信息
+    // 汇总所有设备的 SHM 信号信息
     for (i = 0; i < dev_len; i++) {
         dev = &shm_devs[i];
         total_signals += dev->shm_signal_count;

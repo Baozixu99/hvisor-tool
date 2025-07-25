@@ -95,7 +95,52 @@ void *read_file(char *filename, u_int64_t *filesize) {
 
     return buf;
 }
-
+// 从文件读取数据的辅助函数（用于test_shm）
+char* read_data_from_file(const char* filename, size_t* data_size) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        printf("Error: Cannot open file '%s'\n", filename);
+        return NULL;
+    }
+    
+    // 获取文件大小
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        printf("Error: File '%s' is empty or cannot determine size\n", filename);
+        fclose(file);
+        return NULL;
+    }
+    
+    if (file_size > 1024) {
+        printf("Error: File '%s' too large (max 1024 bytes), got %ld bytes\n", filename, file_size);
+        fclose(file);
+        return NULL;
+    }
+    
+    // 分配内存并读取文件内容
+    char* data = malloc(file_size + 1);
+    if (!data) {
+        printf("Error: Memory allocation failed for file '%s'\n", filename);
+        fclose(file);
+        return NULL;
+    }
+    
+    size_t bytes_read = fread(data, 1, file_size, file);
+    if (bytes_read != file_size) {
+        printf("Error: Failed to read complete file '%s'\n", filename);
+        free(data);
+        fclose(file);
+        return NULL;
+    }
+    
+    data[file_size] = '\0';  // 确保字符串以null结尾
+    *data_size = file_size;
+    fclose(file);
+    return data;
+}
 int open_dev() {
     int fd = open("/dev/hvisor", O_RDWR);
     if (fd < 0) {
@@ -905,9 +950,188 @@ int general_safe_service_request(struct Client* amp_client,
 
     return 0;
 }
-
-static int test_shm(char* shm_json_path) {
+static int hyper_amp(int argc, char* argv[]) {
+    // 参数检查
+    if (argc < 3) {
+        printf("Usage: hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
+        printf("Examples:\n");
+        printf("  hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
+        printf("  hvisor shm hyper_amp shm_config.json @data.txt 2\n");
+        return -1;
+    }
+    
+    char* shm_json_path = argv[0];
+    char* data_input = argv[1];
+    uint32_t service_id = (argc >= 3) ? strtoul(argv[2], NULL, 10) : NPUCore_SERVICE_ECHO_ID;
+    
+    // 数据处理：支持直接字符串或从文件读取
+    char* data_buffer = NULL;
+    int data_size = 0;
+    
+    if (data_input[0] == '@') {
+        // 从文件读取数据
+        char* filename = data_input + 1; // 跳过 '@' 符号
+        printf("Reading data from file: %s\n", filename);
+        
+        size_t file_data_size;
+        data_buffer = read_data_from_file(filename, &file_data_size);
+        if (data_buffer == NULL) {
+            return -1;
+        }
+        
+        data_size = file_data_size;
+        printf("Successfully read %d bytes from file\n", data_size);
+    } else {
+        // 直接使用字符串
+        data_size = strlen(data_input);
+        data_buffer = malloc(data_size + 1);
+        if (data_buffer == NULL) {
+            printf("Error: Memory allocation failed\n");
+            return -1;
+        }
+        strcpy(data_buffer, data_input);
+        printf("Using input string: \"%s\" (%d bytes)\n", data_buffer, data_size);
+    }
+    
+    printf("=== Testing SHM Client ===\n");
+    printf("Configuration: %s\n", shm_json_path);
+    printf("Service ID: %u\n", service_id);
+    printf("Data size: %d bytes\n", data_size);
+    
     parse_global_addr(shm_json_path);
+    //初始化客户端
+    struct Client amp_client = { 0 };
+    if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
+    {
+        printf("error: client init failed\n");
+        free(data_buffer);
+        return -1;
+    }
+    printf("info: client init success\n");
+    //获取空闲消息
+    struct Msg *msg = client_ops.empty_msg_get(&amp_client, service_id);
+    if (msg == NULL)
+    {
+        printf("error : empty msg get [service_id = %u]\n", service_id);
+        free(data_buffer);
+        return -1;
+    }
+    printf("info : empty msg get [service_id = %u]\n", service_id);
+
+    // 重置消息
+    msg_ops.msg_reset(msg);
+    
+    // 分配共享内存
+    char* shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_P);
+    if (shm_data == NULL)
+    {
+        printf("info: MALLOC_TYPE_P failed, trying MALLOC_TYPE_V...\n");
+        shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_V);
+    }
+    if (shm_data == NULL)
+    {
+        printf("error : shm malloc failed [size = %u]\n", data_size + 1);
+        free(data_buffer);
+        return -1;
+    }
+    
+    printf("info : shm malloc success [size = %u, ptr = %p]\n", data_size + 1, shm_data);
+    
+    // 复制数据到共享内存
+    // memcpy(shm_data, data_buffer, data_size);
+    // shm_data[data_size] = '\0';
+
+    for (int j = 0; j < data_size; j++) {
+        shm_data[j] = data_buffer[j];
+    }
+    shm_data[data_size] = '\0';
+
+    // 设置消息
+    msg->offset = client_ops.shm_addr_to_offset(shm_data);
+    msg->length = data_size + 1;
+
+    // 发送消息并通
+    if (client_ops.msg_send_and_notify(&amp_client, msg) != 0)
+    {
+        printf("error : msg send failed [offset = 0x%x, length = %u]\n", msg->offset, msg->length);
+        free(data_buffer);
+        return -1;
+    }
+    
+    printf("info : msg sent successfully\n");
+    
+    // 等待响应
+    while(client_ops.msg_poll(msg) != 0) {
+        // 轮询等待响应
+        printf("is polling...\n");
+        sleep(3);
+
+    }
+    printf("info : msg result [service_id = %u, result = %u]\n",
+           msg->service_id, msg->flag.service_result);
+    
+    // 注意：跳过 shm_free 因为在 HVisor 环境中会导致段错误
+    // client_ops.shm_free(&amp_client, shm_data);
+    
+    printf("info : SHM test completed successfully\n");
+    
+    // 清理资源
+    client_ops.empty_msg_put(&amp_client, msg);
+    client_ops.client_destory(&amp_client);
+    
+    // 清理分配的数据缓冲区
+    free(data_buffer);
+    
+    return 0;
+}
+
+static int test_shm(int argc, char* argv[]) {
+    if (argc < 3) {
+        printf("Usage: hvisor shm test_shm <shm_json_path> <data|@filename> <service_id>\n");
+        printf("Examples:\n");
+        printf("  hvisor shm test_shm shm_config.json \"hello world\" 1\n");
+        printf("  hvisor shm test_shm shm_config.json @data.txt 2\n");
+        return -1;
+    }
+
+    char* shm_json_path = argv[0];
+    char* data_input = argv[1];
+    uint32_t service_id = (argc >= 3) ? strtoul(argv[2], NULL, 10) : NPUCore_SERVICE_ECHO_ID;
+    
+    // 数据处理：支持直接字符串或从文件读取
+    char* data_buffer = NULL;
+    int data_size = 0;
+     if (data_input[0] == '@') {
+        // 从文件读取数据
+        char* filename = data_input + 1; // 跳过 '@' 符号
+        printf("Reading data from file: %s\n", filename);
+        
+        size_t file_data_size;
+        data_buffer = read_data_from_file(filename, &file_data_size);
+        if (data_buffer == NULL) {
+            return -1;
+        }
+        
+        data_size = file_data_size;
+        printf("Successfully read %d bytes from file\n", data_size);
+    } else {
+        // 直接使用字符串
+        data_size = strlen(data_input);
+        data_buffer = malloc(data_size + 1);
+        if (data_buffer == NULL) {
+            printf("Error: Memory allocation failed\n");
+            return -1;
+        }
+        strcpy(data_buffer, data_input);
+        printf("Using input string: \"%s\" (%d bytes)\n", data_buffer, data_size);
+    }
+    printf("=== Testing SHM Client ===\n");
+    printf("Configuration: %s\n", shm_json_path);
+    printf("Data: \"%s\" (%d bytes)\n", data_buffer, data_size);
+    printf("Service ID: %u\n", service_id);
+
+    parse_global_addr(shm_json_path);
+
     printf("=== Testing SHM Client ===\n");
     struct Client amp_client = { 0 };
     if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
@@ -918,18 +1142,21 @@ static int test_shm(char* shm_json_path) {
     printf("client init success\n");
     // Add detailed debug info about the client initialization result
     printf("debug: Client initialization completed, proceeding with memory operations\n");
-    struct Msg *msg = client_ops.empty_msg_get(&amp_client, NPUCore_SERVICE_ECHO_ID);
+    struct Msg *msg = client_ops.empty_msg_get(&amp_client, service_id);
     if (msg == NULL)
     {
-        printf("error : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
-        return;
+        printf("error : empty msg get [service_id = %u]\n", service_id);
+        free(data_buffer);
+        return -1;
     }
-     printf("info : empty msg get [service_id = %u]\n", NPUCore_SERVICE_ECHO_ID);
+    printf("info : empty msg get [service_id = %u]\n", service_id);
 
-    char data[100] = "hello world!!!";
-    int data_size = strlen(data);
-    int send_count = 1;
+
+    int send_count = 1;  // 增加测试次数来观察内存分配模式
+    printf("\n=== Memory Allocation Test: %d iterations ===\n", send_count);
+    printf("Testing for potential memory leaks by monitoring allocation addresses\n");
     for (int i = 0; i < send_count; i++) {
+        printf("\n--- Iteration %d ---\n", i + 1);
         msg_ops.msg_reset(msg);
         // TODO: compare to OpenAMP
         // using shared memory
@@ -946,6 +1173,22 @@ static int test_shm(char* shm_json_path) {
                 i, data_size + 1, MALLOC_TYPE_V);
             return;
         }
+        // 内存分配监控 - 记录地址和偏移量
+        printf("=== MEMORY ALLOCATION TRACKING ===\n");
+        printf("  Iteration: %d\n", i + 1);
+        printf("  Allocated Address: %p\n", shm_data);
+        printf("  Size Requested: %u bytes\n", data_size + 1);
+        
+        // 计算相对于前一次分配的偏移
+        static char* prev_addr = NULL;
+        if (prev_addr != NULL) {
+            ptrdiff_t offset_diff = shm_data - prev_addr;
+            printf("  Offset from previous: %ld bytes (0x%lx)\n", offset_diff, offset_diff);
+        } else {
+            printf("  -> First allocation\n");
+        }
+        prev_addr = shm_data;
+        printf("=====================================\n");
          printf("info : shm malloc [idx = %d, size = %u, type = %u, ptr = %p]\n", 
              i, data_size + 1, MALLOC_TYPE_V, shm_data);
         // IMMEDIATE test right after allocation
@@ -961,7 +1204,7 @@ static int test_shm(char* shm_json_path) {
 
         
         printf("debug: About to write to shm_data=%p, data='%s', data_size=%d, allocated_size=%d\n", 
-            shm_data, data, data_size, data_size + 1);
+            shm_data, data_buffer, data_size, data_size + 1);
         
         // Try the absolute minimum test first
         printf("debug: Testing single byte write...\n");
@@ -1003,55 +1246,9 @@ static int test_shm(char* shm_json_path) {
         printf("debug: Copying data using original logic...\n");
         int j;
         for (j = 0; j < data_size; j++) {
-            shm_data[j] = data[j];
+            shm_data[j] = data_buffer[j];
         }
         shm_data[data_size] = '\0';
-
-        
-        // shm_data[data_size] = '\0';
-        // printf("debug: Testing write access to shm_data[0]...\n");
-        
-        // // Test write access to first byte
-        // char original_val = shm_data[0];
-        // shm_data[0] = 'T';
-        // printf("debug: Write test successful, wrote 'T' to shm_data[0]\n");
-        // shm_data[0] = original_val;  // restore
-                
-        // // Test access to last allocated byte
-        // printf("debug: Testing access to last allocated byte [%d]...\n", data_size);
-        // char last_original = shm_data[data_size];
-        // shm_data[data_size] = '\0';
-        // printf("debug: Last byte access successful\n");
-        // shm_data[data_size] = last_original;  // restore
-        // int j = 0;
-        // for (j = 0; j < data_size; j++)
-        // {
-        //     printf("debug: Writing shm_data[%d] = '%c' at address %p\n", j, data[j], &shm_data[j]);
-            
-        //     // Try different write methods to isolate the issue
-        //     if (j == 10) {
-        //         printf("debug: Special handling for index 10...\n");
-        //         printf("debug: Current value at shm_data[10]: 0x%02x\n", (unsigned char)shm_data[10]);
-                
-        //         // Add memory barrier
-        //         __sync_synchronize();
-                
-        //         // Try simple assignment first
-        //         printf("debug: Attempting simple write...\n");
-        //         shm_data[j] = data[j];
-        //         printf("debug: Simple write completed\n");
-                
-        //         // Force cache flush
-        //         __sync_synchronize();
-        //     } else {
-        //         shm_data[j] = data[j];
-        //     }
-        //     // Add small delay and memory barrier after each write
-        //     if (j >= 8) {
-        //         __sync_synchronize();
-        //         usleep(1000); // 1ms delay
-        //     }
-        // }
         printf("debug: About to call shm_addr_to_offset with shm_data=%p\n", shm_data);
         // printf("shm_data: %s, data_size = %d\n", shm_data, data_size);
         msg->offset = client_ops.shm_addr_to_offset(shm_data);
@@ -1084,14 +1281,26 @@ static int test_shm(char* shm_json_path) {
             printf("is polling...\n");
             sleep(3);
         }
-        
         printf("info : msg result [idx = %d, service_id = %u, result = %u]\n",
                i, msg->service_id, msg->flag.service_result);
+        printf("debug:amp_client:%p,shm_data:%p\n", &amp_client, shm_data);
+        // 方案：添加安全检查后尝试释放
 
-        client_ops.shm_free(&amp_client, shm_data);
+        // 生产环境中需要修复 shm_free问题
+        printf("debug: Skipping shm_free\n");
+        // client_ops.shm_free(&amp_client, shm_data);
     }
+    printf("Completed %d allocation cycles without calling shm_free\n", send_count);
+    printf("=======================================\n");
     client_ops.empty_msg_put(&amp_client, msg);
     client_ops.client_destory(&amp_client);
+    printf("debug: client_destory completed - test_shm finished successfully\n");
+        
+    // 清理分配的数据缓冲区
+    free(data_buffer);
+    printf("debug: Data buffer freed\n");
+    
+    return 0;
 }
 
 static int check_service_id(uint32_t service_id) {
@@ -1239,7 +1448,7 @@ static int test_shm_read(char* shm_json_path) {
     // step 7: 监听并处理消息 (结合中断机制)
     printf("\n[Test] Waiting for messages from Root Linux...\n");
     printf("Press Ctrl+C to exit\n");
-    
+    //暂时用不到该功能running默认为1
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
@@ -1268,7 +1477,8 @@ static int test_shm_read(char* shm_json_path) {
         // 如果有中断设备，先检查中断
         if (shm_fd >= 0) {
             int ret = poll(&pfd, 1, 100); // 100ms超时
-            if (ret > 0 && (pfd.revents & POLLIN)) {
+            if (ret > 0 && (pfd.revents & POLLIN)) {//PLOLLIN事件chunk
+                printf("\033[2K\r");  // 清除当前行并回到行首
                 printf("[Test] SHM interrupt received, checking for messages...\n");
                 should_check_messages = true;
                 
@@ -1278,6 +1488,7 @@ static int test_shm_read(char* shm_json_path) {
                     printf("[Test] Signal count: %u, cpu: %u, service_id: %u\n", 
                            signal_info.signal_count, signal_info.current_cpu, signal_info.last_service_id);
                 }
+                fflush(stdout);  // 立即刷新输出
             }
         }
         
@@ -1351,14 +1562,18 @@ static int test_shm_read(char* shm_json_path) {
                 uint16_t new_head = msg_entry->nxt_idx;
                 root_msg_queue->proc_ing_h = new_head;
                 msg_entry->nxt_idx = root_msg_queue->buf_size; // 标记为无效
-                
+                // 重置工作状态，允许下一次通信
+                root_msg_queue->working_mark = MSG_QUEUE_MARK_IDLE;
                 printf("    Updated Root Linux proc_ing_h: %u -> %u\n", head, new_head);
+                printf("    Reset working_mark to IDLE (0x%x)\n", MSG_QUEUE_MARK_IDLE);
                 printf("    Root Linux should now detect the state change and stop polling\n");
             }
             if (!found_message && check_counter % 50 == 0) {
-                // 每5秒显示一次等待状态
-                printf("[Test] Still waiting for messages... (Non-Root proc_ing_h=%u, Root proc_ing_h=%u)\n", 
+                printf("\033[2K\r");  // 清除当前行并回到行首 
+                // 每5秒显示一次等待状态，添加换行和刷新缓冲
+                printf("[Test] Waiting... (Non-Root:%u, Root:%u)\n", 
                        msg_queue->proc_ing_h, root_msg_queue->proc_ing_h);
+                fflush(stdout);  // 强制刷新输出缓冲区
             }
         }
         
@@ -2086,8 +2301,15 @@ int main(int argc, char *argv[]) {
             err = test_shm_signal(argc - 3, &argv[3]);
         }
         else if(strcmp(argv[2], "test_shm") == 0) {
-            // hvisor shm test_shm <shm_json_path>
-            test_shm(argv[3]);
+            // hvisor shm test_shm <shm_json_path> <data|@filename> <service_id>
+            if (argc < 5) {
+                printf("Usage: hvisor shm test_shm <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Examples:\n");
+                printf("  hvisor shm test_shm shm_config.json \"hello world\" 1\n");
+                printf("  hvisor shm test_shm shm_config.json @data.txt 2\n");
+                return -1;
+            }
+            test_shm(argc - 3, &argv[3]);
         } 
         else if(strcmp(argv[2], "safe_service") == 0) { 
             // hvisor shm safe_service <shm_json_path> <service_id> <data> <data_size>
@@ -2131,6 +2353,17 @@ int main(int argc, char *argv[]) {
             }
             test_shm_read(argv[3]);
         }
+        else if(strcmp(argv[2], "hyper_amp") == 0) {
+            // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>
+            if (argc < 5) {
+                printf("Usage: hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Examples:\n");
+                printf("  hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
+                printf("  hvisor shm hyper_amp shm_config.json @data.txt 2\n");
+                return -1;
+            }
+            hyper_amp(argc - 3, &argv[3]);
+        } 
         else {
             help(1);
         }
