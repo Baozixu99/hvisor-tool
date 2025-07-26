@@ -46,14 +46,22 @@ static void __attribute__((noreturn)) help(int exit_status) {
     printf("  zone start    <config.json>    Initialize an isolation zone\n");
     printf("  zone shutdown -id <zone_id>   Terminate a zone by ID\n");
     printf("  zone list                      List all active zones\n");
-    printf("  virtio start  <virtio.json>    Activate virtio devices\n\n");
+    printf("  virtio start  <virtio.json>    Activate virtio devices\n");
+    printf("  shm hyper_amp <config> <data> <svc_id>  HyperAMP communication test\n");
+    printf("  shm receiver                   Start SHM signal receiver\n");
+    printf("  shm server    <config.json>    Start SHM service server\n\n");
     printf("Options:\n");
     printf("  --id <zone_id>    Specify zone ID for shutdown\n");
     printf("  --help            Show this help message\n\n");
     printf("Examples:\n");
-    printf("  Start zone:    hvisor zone start /path/to/vm.json\n");
-    printf("  Shutdown zone: hvisor zone shutdown -id 1\n");
-    printf("  List zones:    hvisor zone list\n");
+    printf("  Start zone:      hvisor zone start /path/to/vm.json\n");
+    printf("  Shutdown zone:   hvisor zone shutdown -id 1\n");
+    printf("  List zones:      hvisor zone list\n");
+    printf("  SHM server:      hvisor shm server /path/to/shm.json\n");
+    printf("  HyperAMP client encrypt: hvisor shm hyper_amp shm_config.json \"hello\" 1\n");
+    printf("  HyperAMP client decrypt: hvisor shm hyper_amp shm_config.json \"encrypted\" 2\n");
+    printf("  HyperAMP service : hvisor shm hyper_amp_service /path/to/shm_config.json\n");
+
     exit(exit_status);
 }
 
@@ -841,6 +849,104 @@ static int test_shm_signal(int argc, char *argv[]) {
 #include "shm/config/config_zone.h"
 #include "service/safe_service.h"
 
+// ===== HyperAMP 安全服务加解密函数 =====
+
+/**
+ * AES-like 加密函数 (简化版) - Service ID 1
+ * 使用简单的字节替换和位移操作模拟AES加密
+ */
+static int hyperamp_encrypt_service(char* data, int data_len, int max_len) {
+    if (data == NULL || data_len <= 0 || max_len <= 0) {
+        return -1;
+    }
+    
+    printf("[HyperAMP] Executing encryption service (Service ID: 1)\n");
+    printf("[HyperAMP] Input data length: %d bytes\n", data_len);
+    
+    // 显示原始数据
+    printf("[HyperAMP] Original data: ");
+    for (int i = 0; i < data_len; i++) {
+        printf("0x%02x ", (unsigned char)data[i]);
+    }
+    printf("\n");    
+    // 简化的加密密钥 (16字节)
+    const unsigned char key[16] = {
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+    };
+    
+    // 加密过程：多轮字节替换和XOR操作
+        for (int i = 0; i < data_len; i++) {
+            unsigned char byte = (unsigned char)data[i];
+            
+            // 简单XOR加密
+            byte ^= key[i % 16];
+            
+            // // Round 2: 字节替换 (S-Box模拟)
+            // byte = ((byte << 1) | (byte >> 7)) & 0xFF;  // 循环左移1位
+            byte ^= 0x55;// 额外的固定XOR
+            // // Round 3: 再次XOR
+            // byte ^= key[(i + round) % 16];
+            
+            data[i] = (char)byte;
+        }
+    // 显示加密后数据
+    printf("[HyperAMP] Encrypted data: ");
+    for (int i = 0; i < data_len; i++) {
+        printf("0x%02x ", (unsigned char)data[i]);
+    }
+    printf("\n");
+
+    printf("[HyperAMP] Encryption completed successfully\n");
+    return 0;
+}
+
+/**
+ * AES-like 解密函数 (简化版) - Service ID 2  
+ * 对应加密函数的逆向操作
+ */
+static int hyperamp_decrypt_service(char* data, int data_len, int max_len) {
+    if (data == NULL || data_len <= 0 || max_len <= 0) {
+        return -1;
+    }
+    
+    printf("[HyperAMP] Executing decryption service (Service ID: 2)\n");
+    printf("[HyperAMP] Input data length: %d bytes\n", data_len);
+    
+    // 显示加密数据
+    printf("[HyperAMP] Encrypted data: ");
+    for (int i = 0; i < data_len; i++) {
+        printf("0x%02x ", (unsigned char)data[i]);
+    }
+    printf("\n");
+    
+    // 相同的解密密钥
+    const unsigned char key[16] = {
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+    };
+    
+    // 解密过程：完全逆向加密操作
+    for (int i = 0; i < data_len; i++) {
+        unsigned char byte = (unsigned char)data[i];
+        
+        // 逆向操作（与加密顺序相反）
+        byte ^= 0x55;                // 逆向固定XOR
+        byte ^= key[i % 16];         // 逆向密钥XOR
+        
+        data[i] = (char)byte;
+    }
+    
+    // 显示解密后数据
+    printf("[HyperAMP] Decrypted data: ");
+    for (int i = 0; i < data_len; i++) {
+        printf("0x%02x ", (unsigned char)data[i]);
+    }
+    printf("\n");
+    
+    printf("[HyperAMP] Decryption completed successfully\n");
+    return 0;
+}
 static Service services[] = {
     {0, "null", 0},
     {1, "echo string", 0},
@@ -950,13 +1056,14 @@ int general_safe_service_request(struct Client* amp_client,
 
     return 0;
 }
-static int hyper_amp(int argc, char* argv[]) {
+static int hyper_amp_client(int argc, char* argv[]) {
     // 参数检查
     if (argc < 3) {
         printf("Usage: hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
         printf("Examples:\n");
         printf("  hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
         printf("  hvisor shm hyper_amp shm_config.json @data.txt 2\n");
+        printf("  hvisor shm hyper_amp shm_config.json hex:48656c6c6f 2  (hex input)\n");
         return -1;
     }
     
@@ -974,13 +1081,88 @@ static int hyper_amp(int argc, char* argv[]) {
         printf("Reading data from file: %s\n", filename);
         
         size_t file_data_size;
-        data_buffer = read_data_from_file(filename, &file_data_size);
-        if (data_buffer == NULL) {
+        char* file_content = read_data_from_file(filename, &file_data_size);
+        if (file_content == NULL) {
             return -1;
         }
         
-        data_size = file_data_size;
-        printf("Successfully read %d bytes from file\n", data_size);
+        printf("Successfully read %d bytes from file\n", (int)file_data_size);
+        
+        // 检查文件内容是否以 "hex:" 开头
+        if (file_data_size >= 4 && strncmp(file_content, "hex:", 4) == 0) {
+            // 文件内容是十六进制格式，进行解析
+            char* hex_str = file_content + 4; // 跳过 "hex:" 前缀
+            int hex_len = strlen(hex_str);
+            
+            // 移除可能的换行符
+            if (hex_len > 0 && hex_str[hex_len-1] == '\n') {
+                hex_str[hex_len-1] = '\0';
+                hex_len--;
+            }
+            
+            if (hex_len % 2 != 0) {
+                printf("Error: Hex string in file must have even number of characters\n");
+                free(file_content);
+                return -1;
+            }
+            
+            data_size = hex_len / 2;
+            data_buffer = malloc(data_size + 1);
+            if (data_buffer == NULL) {
+                printf("Error: Memory allocation failed\n");
+                free(file_content);
+                return -1;
+            }
+            
+            // 转换十六进制字符串为字节
+            for (int i = 0; i < data_size; i++) {
+                char hex_byte[3] = {hex_str[i*2], hex_str[i*2+1], '\0'};
+                data_buffer[i] = (char)strtol(hex_byte, NULL, 16);
+            }
+            data_buffer[data_size] = '\0';
+            
+            printf("Using hex data from file: ");
+            for (int i = 0; i < data_size; i++) {
+                printf("%02x ", (unsigned char)data_buffer[i]);
+            }
+            printf("(%d bytes)\n", data_size);
+            
+            free(file_content);
+        } else {
+            // 文件内容是普通文本
+            data_buffer = file_content;
+            data_size = file_data_size;
+            printf("Using file content as text: \"%s\" (%d bytes)\n", data_buffer, data_size);
+        }
+    } else if (strncmp(data_input, "hex:", 4) == 0) {
+        // 十六进制输入支持: hex:48656c6c6f
+        char* hex_str = data_input + 4; // 跳过 "hex:" 前缀
+        int hex_len = strlen(hex_str);
+        
+        if (hex_len % 2 != 0) {
+            printf("Error: Hex string must have even number of characters\n");
+            return -1;
+        }
+        
+        data_size = hex_len / 2;
+        data_buffer = malloc(data_size + 1);
+        if (data_buffer == NULL) {
+            printf("Error: Memory allocation failed\n");
+            return -1;
+        }
+        
+        // 转换十六进制字符串为字节
+        for (int i = 0; i < data_size; i++) {
+            char hex_byte[3] = {hex_str[i*2], hex_str[i*2+1], '\0'};
+            data_buffer[i] = (char)strtol(hex_byte, NULL, 16);
+        }
+        data_buffer[data_size] = '\0';
+        
+        printf("Using hex input: ");
+        for (int i = 0; i < data_size; i++) {
+            printf("%02x ", (unsigned char)data_buffer[i]);
+        }
+        printf("(%d bytes)\n", data_size);
     } else {
         // 直接使用字符串
         data_size = strlen(data_input);
@@ -1061,14 +1243,105 @@ static int hyper_amp(int argc, char* argv[]) {
     printf("info : msg sent successfully\n");
     
     // 等待响应
+    printf("info : waiting for Non-Root Linux to process the request...\n");
     while(client_ops.msg_poll(msg) != 0) {
         // 轮询等待响应
         printf("is polling...\n");
         sleep(3);
 
     }
-    printf("info : msg result [service_id = %u, result = %u]\n",
-           msg->service_id, msg->flag.service_result);
+        // 读取处理后的结果数据
+    if (msg->flag.service_result == MSG_SERVICE_RET_SUCCESS) {
+        printf("=== HyperAMP Service Result ===\n");
+        
+        // 获取处理后的实际数据大小（可能与输入大小不同）
+        int result_data_size = msg->length > 0 ? msg->length - 1 : 0; // 减去末尾的 null terminator
+        if (result_data_size <= 0) {
+            result_data_size = data_size; // 回退到原始大小
+        }
+
+        if (service_id == 1) {
+            printf("Encryption completed. Encrypted data:\n");
+        } else if (service_id == 2) {
+            printf("Decryption completed. Decrypted data:\n");
+        } else {
+            printf("Service %u completed. Result data:\n", service_id);
+        }
+        // 确定显示长度：小于等于256字节全部显示，超过则显示前64字节
+        int display_length = result_data_size;
+        bool truncated = false;
+        if (result_data_size > 256) {
+            display_length = 64;
+            truncated = true;
+        }
+        
+        // 生成输出文件名
+        char output_filename[256];
+        if (service_id == 1) {
+            snprintf(output_filename, sizeof(output_filename), "encrypted_result.txt");
+        } else if (service_id == 2) {
+            snprintf(output_filename, sizeof(output_filename), "decrypted_result.txt");
+        } else {
+            snprintf(output_filename, sizeof(output_filename), "service_%u_result.txt", service_id);
+        }
+        
+        // 打开文件准备保存
+        FILE* output_file = fopen(output_filename, "wb");        
+        // 安全地显示处理后的数据 -使用动态显示长度
+        printf("Result: [");
+        for (int i = 0; i < display_length; i++) {
+            // 同时写入文件（如果文件打开成功）
+            if (output_file != NULL) {
+                fputc(shm_data[i], output_file);
+            }
+            
+            if (shm_data[i] >= 32 && shm_data[i] <= 126) {  // 可打印字符
+                printf("%c", shm_data[i]);
+            } else if (shm_data[i] == '\n') {  // 换行符特殊处理
+                printf("\\n");
+            } else if (shm_data[i] == '\r') {  // 回车符特殊处理
+                printf("\\r");
+            } else if (shm_data[i] == '\t') {  // 制表符特殊处理
+                printf("\\t");
+            } else {
+                printf("\\x%02x", (unsigned char)shm_data[i]);
+            }
+        }       
+        if (truncated) {
+            printf("... (showing first %d of %d bytes)", display_length, result_data_size);
+        }
+        printf("] (%d bytes)\n", result_data_size);
+        
+        // 显示十六进制格式 - 同样使用动态显示长度
+        printf("Hex format: ");
+        for (int i = 0; i < display_length; i++) {
+            printf("%02x", (unsigned char)shm_data[i]);
+        }
+        if (truncated) {
+            printf("... (showing first %d of %d bytes)", display_length, result_data_size);
+        }
+        printf("\n");
+        // 如果数据被截断，提示查看完整内容的方法
+        if (truncated) {
+            printf("Note: Large data truncated for display. Full data saved to file.\n");
+        }        
+        // 如果是加密服务，提供解密命令提示 - 添加安全检查，使用实际结果大小
+        if (service_id == 1 && result_data_size > 0 && result_data_size <= 64) {
+            printf("\nTo decrypt, use: ./hvisor shm hyper_amp %s hex:", shm_json_path);
+            for (int i = 0; i < result_data_size; i++) {
+                printf("%02x", (unsigned char)shm_data[i]);
+            }
+            printf(" 2\n");
+            printf("Or from file: ./hvisor shm hyper_amp %s @%s 2\n", shm_json_path, output_filename);
+        } else if (service_id == 1 && result_data_size > 64) {
+            printf("\nData too large for command line hex display. Use file input:\n");
+            printf("./hvisor shm hyper_amp %s @%s 2\n", shm_json_path, output_filename);
+        }
+        
+        printf("===============================\n");
+    } else {
+        printf("error : HyperAMP service failed [service_id = %u]\n", service_id);
+    }
     
     // 注意：跳过 shm_free 因为在 HVisor 环境中会导致段错误
     // client_ops.shm_free(&amp_client, shm_data);
@@ -1311,7 +1584,7 @@ static int check_service_id(uint32_t service_id) {
     }
 }
 // 简化版测试服务端 - 验证共享内存数据读取
-static int test_shm_read(char* shm_json_path) {
+static int hyper_amp_service(char* shm_json_path) {
     printf("=== Non-Root Linux SHM Read Test ===\n");
     printf("Initializing as SHM server to read client data...\n");
     
@@ -1542,16 +1815,67 @@ static int test_shm_read(char* shm_json_path) {
                     }
                     if (msg->length > 32) printf("...");
                     printf("] (%u bytes) ***\n", msg->length);                    
-                    // 处理数据
-                    printf("    Processing data...\n");
+                    // ===== HyperAMP 安全服务处理 =====
+                    printf("    Processing HyperAMP secure service (Service ID: %u)...\n", msg->service_id);
                     
-                    // 标记消息已处理 - 这是关键步骤！
+                    int service_result = MSG_SERVICE_RET_SUCCESS;
+                    bool data_modified = false;
+                    
+                    // 根据 service_id 执行相应的安全服务
+                    switch (msg->service_id) {
+                        case 1:  // 加密服务
+                            printf("    [HyperAMP] Executing ENCRYPTION service\n");
+                            if (hyperamp_encrypt_service(data_ptr, msg->length - 1, msg->length) == 0) {
+                                printf("    [HyperAMP] Encryption completed successfully\n");
+                                data_modified = true;
+                            } else {
+                                printf("    [HyperAMP] Encryption failed\n");
+                                service_result = MSG_SERVICE_RET_FAIL;
+                            }
+                            break;
+                            
+                        case 2:  // 解密服务
+                            printf("    [HyperAMP] Executing DECRYPTION service\n");
+                            if (hyperamp_decrypt_service(data_ptr, msg->length - 1, msg->length) == 0) {
+                                printf("    [HyperAMP] Decryption completed successfully\n");
+                                data_modified = true;
+                            } else {
+                                printf("    [HyperAMP] Decryption failed\n");
+                                service_result = MSG_SERVICE_RET_FAIL;
+                            }
+                            break;
+                            
+                        case 66:  // 测试服务 (Echo)
+                            printf("    [HyperAMP] Executing ECHO test service\n");
+                            // Echo服务不修改数据，只是测试通信
+                            break;
+                            
+                        default:
+                            printf("    [HyperAMP] Unknown service ID: %u, treating as echo\n", msg->service_id);
+                            break;
+                    }
+                    
+                    // 如果数据被修改，显示处理后的结果
+                    if (data_modified) {
+                        printf("    *** PROCESSED DATA: [");
+                        for (int i = 0; i < msg->length && i < 32; i++) {
+                            if (data_ptr[i] >= 32 && data_ptr[i] <= 126) {
+                                printf("%c", data_ptr[i]);
+                            } else {
+                                printf("\\x%02x", (unsigned char)data_ptr[i]);
+                            }
+                        }
+                        if (msg->length > 32) printf("...");
+                        printf("] ***\n");
+                    }
+                    
+                    // 标记消息已处理
                     printf("    Setting deal_state to MSG_DEAL_STATE_YES...\n");
                     msg->flag.deal_state = MSG_DEAL_STATE_YES;
-                    msg->flag.service_result = MSG_SERVICE_RET_SUCCESS;
+                    msg->flag.service_result = service_result;
                     
-                    printf("    *** MESSAGE PROCESSED SUCCESSFULLY! ***\n");
-                    printf("    Root Linux should now detect completion and stop polling\n");
+                    printf("    *** HYPERAMP SERVICE COMPLETED! ***\n");
+                    printf("    Root Linux should now detect completion and read processed data\n");
                 } else {
                     printf("    No data to read (length=%u)\n", msg->length);
                     msg->flag.deal_state = MSG_DEAL_STATE_YES;
@@ -2344,14 +2668,14 @@ int main(int argc, char *argv[]) {
             }
             shm_server(argv[3]);
         }
-        else if(strcmp(argv[2], "test_read") == 0) {
-            // hvisor shm test_read <shm_json_path>
+        else if(strcmp(argv[2], "hyper_amp_service") == 0) {
+            // hvisor shm hyper_amp_service <shm_json_path>
             if (argc < 4) {
-                printf("Usage: hvisor shm test_read <shm_json_path>\n");
-                printf("Example: hvisor shm test_read /path/to/shm_config.json\n");
+                printf("Usage: hvisor shm hyper_amp_service <shm_json_path>\n");
+                printf("Example: hvisor shm hyper_amp_service /path/to/shm_config.json\n");
                 help(1);
             }
-            test_shm_read(argv[3]);
+            hyper_amp_service(argv[3]);
         }
         else if(strcmp(argv[2], "hyper_amp") == 0) {
             // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>
@@ -2362,7 +2686,7 @@ int main(int argc, char *argv[]) {
                 printf("  hvisor shm hyper_amp shm_config.json @data.txt 2\n");
                 return -1;
             }
-            hyper_amp(argc - 3, &argv[3]);
+            hyper_amp_client(argc - 3, &argv[3]);
         } 
         else {
             help(1);
