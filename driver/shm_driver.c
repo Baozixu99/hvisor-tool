@@ -216,22 +216,13 @@ static const struct file_operations shm_fops = {
 static irqreturn_t shm_irq_handler(int irq, void *dev_id) {
     int i;
     struct shm_dev *this_dev = NULL;
-    pr_info("SHM test start");
     for (i = 0; i < dev_len; i++)
         if (dev_id == &shm_devs[i])
             this_dev = (struct shm_dev *)dev_id;
     if (!this_dev)
         return IRQ_NONE;
-
     this_dev->received_irq++;
-    this_dev->shm_signal_count++;
-    this_dev->last_shm_timestamp = ktime_get_ns();
-    this_dev->last_service_id = 0; // 暂时设为0，后续可以通过其他方式获取
-    pr_info("IVC: Received SHM signal on CPU %d, count: %d\n", 
-            smp_processor_id(), this_dev->shm_signal_count);
-
     wake_up(&this_dev->wq);
-    pr_info("SHM test end");
     return IRQ_HANDLED;
 }
 

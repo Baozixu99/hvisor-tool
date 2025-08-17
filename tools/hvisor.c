@@ -14,7 +14,12 @@
 #include <assert.h>
 #include <stdint.h>
 #include <poll.h>
+#include <time.h>  
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE             
+#include <sys/time.h>  
 
+#include <stdio.h>
 #include "cJSON.h"
 #include "event_monitor.h"
 #include "hvisor.h"
@@ -30,8 +35,14 @@
 #include <sys/ioctl.h>
 #include "shm/addr.h"
 #include "shm/config/config_addr.h"
+#include "shm/time_utils.h" 
+
 // Global variables for signal handling
 static volatile int running = 1;
+struct timespec start_time;
+struct timespec end_time;
+struct timespec service_end_time;
+struct timespec service_start_time;
 
 // Signal handler function
 static void signal_handler(int signal) {
@@ -58,10 +69,11 @@ static void __attribute__((noreturn)) help(int exit_status) {
     printf("  Shutdown zone:   hvisor zone shutdown -id 1\n");
     printf("  List zones:      hvisor zone list\n");
     printf("  SHM server:      hvisor shm server /path/to/shm.json\n");
-    printf("  HyperAMP client encrypt: hvisor shm hyper_amp shm_config.json \"hello\" 1\n");
-    printf("  HyperAMP client decrypt: hvisor shm hyper_amp shm_config.json \"encrypted\" 2\n");
-    printf("  HyperAMP service : hvisor shm hyper_amp_service /path/to/shm_config.json\n");
-
+    printf("  HyperAMP client encrypt: ./hvisor shm hyper_amp shm_config.json \"hello\" 1\n");
+    printf("  HyperAMP client decrypt: ./hvisor shm hyper_amp shm_config.json \"encrypted\" 2\n");
+    printf("  HyperAMP service : ./hvisor shm hyper_amp_service shm_config.json\n");
+    printf("HyperAMP client performance testing: ./hvisor shm hyper_amp_test shm_config.json \"hello\" 1\n");
+    printf("HyperAMP service performance testing: ./hvisor shm hyper_amp_service_test shm_config.json\n");
     exit(exit_status);
 }
 
@@ -2578,6 +2590,596 @@ int shm_receiver() {
     
     return 0;
 }
+static int hyper_amp_service_test(char* shm_json_path) {
+    printf("=== Non-Root Linux SHM Read Test ===\n");
+    printf("Initializing as SHM server to read client data...\n");
+    
+    // step 1: 解析地址配置 (从JSON获取动态地址)
+    parse_global_addr(shm_json_path);
+    printf("[Test] Address configuration parsed\n");
+    
+    // step 2: 映射共享内存地址 (类似 channels_init 中的 mmap)
+    // addr_infos[0] = buf, addr_infos[1] = zone0_msg, addr_infos[2] = zonex_msg
+    
+    // 打开 /dev/mem 来映射物理内存
+    printf("[Test] Opening /dev/mem...\n");
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd < 0) {
+        printf("[Error] Failed to open /dev/mem: %s (errno=%d)\n", strerror(errno), errno);
+        printf("[Info] Make sure you're running as root and /dev/mem is available\n");
+        return -1;
+    }
+    printf("[Test] /dev/mem opened successfully (fd=%d)\n", mem_fd);
+    
+    // 映射缓冲区 (buf)
+    printf("[Test] Mapping buffer: phys=0x%lx, len=0x%x\n", addr_infos[0].start, addr_infos[0].len);
+    void* buf_virt = mmap(NULL, addr_infos[0].len, PROT_READ | PROT_WRITE, 
+                         MAP_SHARED, mem_fd, addr_infos[0].start);
+    if (buf_virt == MAP_FAILED) {
+        printf("[Error] Failed to map buffer memory: %s\n", strerror(errno));
+        close(mem_fd);
+        return -1;
+    }
+    printf("[Test] Buffer mmap successful: %p\n", buf_virt);
+    
+    // 映射消息队列 - 测试：同时映射两个队列来调试
+    printf("[Test] Mapping Non-Root Linux msg queue: phys=0x%lx, len=0x%x\n", addr_infos[2].start, addr_infos[2].len);
+    void* msg_queue_virt = mmap(NULL, addr_infos[2].len, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, mem_fd, addr_infos[2].start);
+    
+    // 同时映射 Root Linux 的队列用于调试
+    printf("[Test] Also mapping Root Linux msg queue for debugging: phys=0x%lx, len=0x%x\n", addr_infos[1].start, addr_infos[1].len);
+    void* root_msg_queue_virt = mmap(NULL, addr_infos[1].len, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, mem_fd, addr_infos[1].start);
+    if (msg_queue_virt == MAP_FAILED) {
+        printf("[Error] Failed to map message queue memory: %s\n", strerror(errno));
+        munmap(buf_virt, addr_infos[0].len);
+        close(mem_fd);
+        return -1;
+    }
+    
+    if (root_msg_queue_virt == MAP_FAILED) {
+        printf("[Error] Failed to map root message queue memory: %s\n", strerror(errno));
+        munmap(buf_virt, addr_infos[0].len);
+        munmap(msg_queue_virt, addr_infos[2].len);
+        close(mem_fd);
+        return -1;
+    }
+    
+    uint64_t buf_addr = (uint64_t)buf_virt;
+    uint64_t msg_queue_addr = (uint64_t)msg_queue_virt;
+    uint64_t root_msg_queue_addr = (uint64_t)root_msg_queue_virt;
+    
+    printf("[Test] Buffer mapped: 0x%lx -> 0x%lx (len: 0x%x)\n", 
+           addr_infos[0].start, buf_addr, addr_infos[0].len);
+    printf("[Test] Non-Root Linux MSG queue mapped: 0x%lx -> 0x%lx (len: 0x%x)\n", 
+           addr_infos[2].start, msg_queue_addr, addr_infos[2].len);
+    printf("[Test] Root Linux MSG queue mapped: 0x%lx -> 0x%lx (len: 0x%x)\n", 
+           addr_infos[1].start, root_msg_queue_addr, addr_infos[1].len);
+    
+    if (msg_queue_addr == 0 || buf_addr == 0 || root_msg_queue_addr == 0) {
+        printf("[Error] Failed to get required addresses\n");
+        return -1;
+    }
+    
+    // step 3: 简单初始化消息队列 (类似 channels_init())
+    printf("[Test] Initializing message queue...\n");
+    struct AmpMsgQueue* msg_queue = (struct AmpMsgQueue*)msg_queue_addr;
+    
+    printf("[Test] Before init - working_mark: 0x%x\n", msg_queue->working_mark);
+    printf("[Test] Current buf_size: %u\n", msg_queue->buf_size);
+    printf("[Test] Current empty_h: %u, wait_h: %u, proc_ing_h: %u\n", 
+           msg_queue->empty_h, msg_queue->wait_h, msg_queue->proc_ing_h);
+    
+    // 设置为已初始化状态 - 这是关键步骤！
+    msg_queue->working_mark = INIT_MARK_INITIALIZED;
+    
+    printf("[Test] After init - working_mark: 0x%x\n", msg_queue->working_mark);
+    printf("[Test] Message queue marked as initialized!\n");
+    
+    // step 4: 显示消息队列状态
+    printf("[Test] Non-Root Linux Message Queue Info:\n");
+    printf("  Buffer size: %u\n", msg_queue->buf_size);
+    printf("  Empty head: %u\n", msg_queue->empty_h);
+    printf("  Wait head: %u\n", msg_queue->wait_h);
+    printf("  Processing head: %u\n", msg_queue->proc_ing_h);
+    
+    // 同时检查 Root Linux 队列状态
+    struct AmpMsgQueue* root_msg_queue = (struct AmpMsgQueue*)root_msg_queue_addr;
+    printf("[Test] Root Linux Message Queue Info:\n");
+    printf("  Working mark: 0x%x\n", root_msg_queue->working_mark);
+    printf("  Buffer size: %u\n", root_msg_queue->buf_size);
+    printf("  Empty head: %u\n", root_msg_queue->empty_h);
+    printf("  Wait head: %u\n", root_msg_queue->wait_h);
+    printf("  Processing head: %u\n", root_msg_queue->proc_ing_h);
+    
+    // step 5: 计算消息实体数组的起始地址 (类似 get_msg_entries_start_addr())
+    uint64_t msg_entries_addr = msg_queue_addr + sizeof(struct AmpMsgQueue);
+    uint64_t root_msg_entries_addr = root_msg_queue_addr + sizeof(struct AmpMsgQueue);
+    printf("[Test] Non-Root message entries start at: 0x%lx\n", msg_entries_addr);
+    printf("[Test] Root message entries start at: 0x%lx\n", root_msg_entries_addr);
+    
+    // step 6: 验证共享缓冲区可访问性 (安全检查)
+    char* test_buf = (char*)buf_addr;
+    printf("[Test] Testing buffer access...\n");
+    printf("[Test] buf_addr = 0x%lx, len = 0x%x\n", buf_addr, addr_infos[0].len);
+    
+    // 更安全的测试 - 先尝试读取，再尝试写入
+    if (buf_addr != 0 && addr_infos[0].len > 100) {
+        printf("[Test] Attempting to read from buffer...\n");
+        volatile char first_byte = test_buf[0];  // 测试读取
+        printf("[Test] First byte read successful: 0x%02x\n", first_byte);
+        
+        printf("[Test] Attempting to write to buffer...\n");
+        test_buf[0] = 'T';  // 测试单字节写入
+        test_buf[1] = 'e';
+        test_buf[2] = 's';
+        test_buf[3] = 't';
+        test_buf[4] = '\0';
+        printf("[Test] Single byte write successful\n");
+        
+        printf("[Test] Buffer test: \"%s\"\n", test_buf);
+    } else {
+        printf("[Test] Buffer access skipped due to safety concerns (addr=0x%lx, len=0x%x)\n", 
+               buf_addr, addr_infos[0].len);
+    }
+    
+    // step 7: 监听并处理消息 (结合中断机制)
+    printf("\n[Test] Waiting for messages from Root Linux...\n");
+    printf("Press Ctrl+C to exit\n");
+    //暂时用不到该功能running默认为1
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    // 打开SHM中断监听设备
+    printf("[Test] Opening /dev/hshm0 for interrupt monitoring...\n");
+    int shm_fd = open("/dev/hshm0", O_RDONLY);
+    if (shm_fd < 0) {
+        printf("[Warning] Failed to open /dev/hshm0: %s\n", strerror(errno));
+        printf("[Info] Will use polling mode instead of interrupt mode\n");
+    } else {
+        printf("[Test] /dev/hshm0 opened successfully for interrupt monitoring\n");
+    }
+    
+    struct pollfd pfd;
+    if (shm_fd >= 0) {
+        pfd.fd = shm_fd;
+        pfd.events = POLLIN;
+    }
+    
+    int msg_count = 0;
+    int check_counter = 0;
+
+    while (running && msg_count < 100) {
+        bool should_check_messages = false;
+        
+        // 如果有中断设备，先检查中断
+        if (shm_fd >= 0) {
+            int ret = poll(&pfd, 1, -1); // 程序阻塞，等待中断
+            clock_gettime(CLOCK_MONOTONIC, &service_start_time);
+            if (ret > 0 && (pfd.revents & POLLIN)) {//PLOLLIN事件chunk
+                printf("\033[2K\r");  // 清除当前行并回到行首
+                printf("[Test] SHM interrupt received, checking for messages...\n");
+                should_check_messages = true;
+
+            }
+        }
+        // 中断触发检查
+        if (should_check_messages) {
+            // 首先检查 Non-Root Linux 自己的队列
+            bool found_message = false;
+          
+            // if (msg_queue->proc_ing_h < msg_queue->buf_size) {
+            //     printf("\n[Test] *** MESSAGE DETECTED IN NON-ROOT QUEUE *** Processing message #%d\n", ++msg_count);
+            //     found_message = true;
+            //     // 处理 Non-Root 队列消息的逻辑...
+            //     // (保留原有逻辑)
+            // }
+            // 关键修改：检查并处理 Root Linux 队列中的消息
+            if (!found_message && root_msg_queue->proc_ing_h < root_msg_queue->buf_size) {
+                printf("\n[Test] *** PROCESSING MESSAGE FROM ROOT LINUX QUEUE *** Message #%d\n", ++msg_count);
+                found_message = true;
+                
+                // 处理 Root Linux 队列中的消息
+                uint16_t head = root_msg_queue->proc_ing_h;
+                uint16_t msg_index = head;
+                
+                // 计算当前消息实体的地址
+                uint64_t msg_entry_addr = root_msg_entries_addr + sizeof(struct MsgEntry) * head;
+                struct MsgEntry* msg_entry = (struct MsgEntry*)msg_entry_addr;
+                struct Msg* msg = &msg_entry->msg;
+                
+                printf("  Root Message details:\n");
+                printf("    Index: %u\n", msg_index);
+                printf("    Service ID: %u\n", msg->service_id);
+                printf("    Offset: 0x%x\n", msg->offset);
+                printf("    Length: %u\n", msg->length);
+                printf("    Deal state: %u\n", msg->flag.deal_state);
+                
+                // 从共享内存读取数据
+                if (msg->length > 0) {
+                    char* data_ptr = (char*)(buf_addr + msg->offset);
+                    printf("    Reading from buf_addr=0x%lx + offset=0x%x = 0x%lx\n", 
+                           buf_addr, msg->offset, (uint64_t)data_ptr);
+                    // 安全地显示数据内容 - 逐字节打印
+                    printf("    *** DATA FROM ROOT LINUX: [");
+                    for (int i = 0; i < msg->length && i < 32; i++) {  // 最多显示32字节
+                        if (data_ptr[i] >= 32 && data_ptr[i] <= 126) {  // 可打印字符
+                            printf("%c", data_ptr[i]);
+                        } else {
+                            printf("\\x%02x", (unsigned char)data_ptr[i]);
+                        }
+                    }
+                    if (msg->length > 32) printf("...");
+                    printf("] (%u bytes) ***\n", msg->length);                    
+                    // ===== HyperAMP 安全服务处理 =====
+                    printf("    Processing HyperAMP secure service (Service ID: %u)...\n", msg->service_id);
+                    
+                    int service_result = MSG_SERVICE_RET_SUCCESS;
+                    bool data_modified = false;
+                    
+                    // 根据 service_id 执行相应的安全服务
+                    switch (msg->service_id) {
+                        case 1:  // 加密服务
+                            printf("    [HyperAMP] Executing ENCRYPTION service\n");
+                            if (hyperamp_encrypt_service(data_ptr, msg->length - 1, msg->length) == 0) {
+                                printf("    [HyperAMP] Encryption completed successfully\n");
+                                data_modified = true;
+                            } else {
+                                printf("    [HyperAMP] Encryption failed\n");
+                                service_result = MSG_SERVICE_RET_FAIL;
+                            }
+                            break;
+                            
+                        case 2:  // 解密服务
+                            printf("    [HyperAMP] Executing DECRYPTION service\n");
+                            if (hyperamp_decrypt_service(data_ptr, msg->length - 1, msg->length) == 0) {
+                                printf("    [HyperAMP] Decryption completed successfully\n");
+                                data_modified = true;
+                            } else {
+                                printf("    [HyperAMP] Decryption failed\n");
+                                service_result = MSG_SERVICE_RET_FAIL;
+                            }
+                            break;
+                            
+                        case 66:  // 测试服务 (Echo)
+                            printf("    [HyperAMP] Executing ECHO test service\n");
+                            // Echo服务不修改数据，只是测试通信
+                            break;
+                            
+                        default:
+                            printf("    [HyperAMP] Unknown service ID: %u, treating as echo\n", msg->service_id);
+                            break;
+                    }
+                    
+                    // 如果数据被修改，显示处理后的结果
+                    if (data_modified) {
+                        printf("    *** PROCESSED DATA: [");
+                        for (int i = 0; i < msg->length && i < 32; i++) {
+                            if (data_ptr[i] >= 32 && data_ptr[i] <= 126) {
+                                printf("%c", data_ptr[i]);
+                            } else {
+                                printf("\\x%02x", (unsigned char)data_ptr[i]);
+                            }
+                        }
+                        if (msg->length > 32) printf("...");
+                        printf("] ***\n");
+                    }
+                    
+                    // 标记消息已处理
+                    printf("    Setting deal_state to MSG_DEAL_STATE_YES...\n");
+                    msg->flag.deal_state = MSG_DEAL_STATE_YES;
+                    msg->flag.service_result = service_result;
+                    
+                    
+                } else {
+                    printf("    No data to read (length=%u)\n", msg->length);
+                    msg->flag.deal_state = MSG_DEAL_STATE_YES;
+                    msg->flag.service_result = MSG_SERVICE_RET_FAIL;
+                }
+                // 更新 Root Linux 队列头
+                uint16_t new_head = msg_entry->nxt_idx;
+                root_msg_queue->proc_ing_h = new_head;
+                msg_entry->nxt_idx = root_msg_queue->buf_size; // 标记为无效
+                // 重置工作状态，允许下一次通信
+                root_msg_queue->working_mark = MSG_QUEUE_MARK_IDLE;
+                printf("    Updated Root Linux proc_ing_h: %u -> %u\n", head, new_head);
+                printf("    Reset working_mark to IDLE (0x%x)\n", MSG_QUEUE_MARK_IDLE);
+                printf("    Root Linux should now detect the state change and stop polling\n");
+                // ==============================================
+                // 性能测试：记录服务端处理结束时间并计算处理时长
+                // ==============================================
+                clock_gettime(CLOCK_MONOTONIC, &service_end_time);
+                    
+                long service_time_us = (service_end_time.tv_sec - service_start_time.tv_sec) * 1000000L + 
+                                          (service_end_time.tv_nsec - service_start_time.tv_nsec) / 1000L;
+                    
+                printf("\n=== HYPERAMP SERVICE PERFORMANCE ===\n");
+                printf("[PERF-SERVICE] Processing Time: %ld μs (%.3f ms)\n", 
+                           service_time_us, service_time_us / 1000.0);
+                printf("[PERF-SERVICE] Message Size: %u bytes\n", msg->length);
+                printf("[PERF-SERVICE] Service ID: %u\n", msg->service_id);
+                printf("[PERF-SERVICE] Throughput: %.2f bytes/sec\n", 
+                           msg->length * 1000000.0 / service_time_us);
+                printf("=====================================\n\n");
+                printf("    *** HYPERAMP SERVICE COMPLETED! ***\n");
+            }
+            if (!found_message && check_counter % 50 == 0) {
+                printf("\033[2K\r");  // 清除当前行并回到行首 
+                // 每5秒显示一次等待状态，添加换行和刷新缓冲
+                printf("[Test] Waiting... (Non-Root:%u, Root:%u)\n", 
+                       msg_queue->proc_ing_h, root_msg_queue->proc_ing_h);
+                fflush(stdout);  // 强制刷新输出缓冲区
+            }
+        }
+        
+        // usleep(100000); // 100ms
+    }
+    
+    printf("\n[Test] SHM read test completed. Processed %d messages.\n", msg_count);
+    
+    // step 8: 清理资源
+    if (shm_fd >= 0) {
+        close(shm_fd);
+        printf("[Test] Closed /dev/hshm0\n");
+    }
+    munmap((void*)buf_addr, addr_infos[0].len);
+    munmap((void*)msg_queue_addr, addr_infos[2].len);
+    munmap((void*)root_msg_queue_addr, addr_infos[1].len);
+    close(mem_fd);
+    
+    return 0;
+}
+
+static int hyper_amp_client_test(int argc, char* argv[]) {
+    // 参数检查
+    if (argc < 3) {
+        printf("Usage: ./hvisor shm hyper_amp_test <shm_json_path> <data|@filename> <service_id>\n");
+        printf("Examples:\n");
+        printf("  ./hvisor shm hyper_amp_test shm_config.json \"hello world\" 1\n");
+        printf("  ./hvisor shm hyper_amp_test shm_config.json @data.txt 2\n");
+        printf("  ./hvisor shm hyper_amp_test shm_config.json hex:48656c6c6f 2  (hex input)\n");
+        return -1;
+    }
+    
+    char* shm_json_path = argv[0];
+    char* data_input = argv[1];
+    uint32_t service_id = (argc >= 3) ? strtoul(argv[2], NULL, 10) : NPUCore_SERVICE_ECHO_ID;
+    // 数据处理：支持直接字符串或从文件读取
+    char* data_buffer = NULL;
+    int data_size = 0;
+    // 直接使用字符串
+    data_size = strlen(data_input);
+    data_buffer = malloc(data_size + 1);
+    if (data_buffer == NULL) {
+        printf("Error: Memory allocation failed\n");
+        return -1;
+    }
+    strcpy(data_buffer, data_input);
+    printf("Using input string: \"%s\" (%d bytes)\n", data_buffer, data_size);
+    parse_global_addr(shm_json_path);
+    //初始化客户端
+    struct Client amp_client = { 0 };
+    if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
+    {
+        printf("error: client init failed\n");
+        free(data_buffer);
+        return -1;
+    }
+    // printf("info: client init success\n");
+    //获取空闲消息
+    struct Msg *msg = client_ops.empty_msg_get(&amp_client, service_id);
+    if (msg == NULL)
+    {
+        printf("error : empty msg get [service_id = %u]\n", service_id);
+        free(data_buffer);
+        return -1;
+    }
+
+    // 重置消息
+    msg_ops.msg_reset(msg);
+    
+    // 分配共享内存
+    char* shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_P);
+    if (shm_data == NULL)
+    {
+        // printf("info: MALLOC_TYPE_P failed, trying MALLOC_TYPE_V...\n");
+        shm_data = (char*)client_ops.shm_malloc(&amp_client, data_size + 1, MALLOC_TYPE_V);
+    }
+    if (shm_data == NULL)
+    {
+        printf("error : shm malloc failed [size = %u]\n", data_size + 1);
+        free(data_buffer);
+        return -1;
+    }
+    
+    
+    // 复制数据到共享内存
+    // memcpy(shm_data, data_buffer, data_size);
+    // shm_data[data_size] = '\0';
+
+    for (int j = 0; j < data_size; j++) {
+        shm_data[j] = data_buffer[j];
+    }
+    shm_data[data_size] = '\0';
+
+    // 设置消息
+    msg->offset = client_ops.shm_addr_to_offset(shm_data);
+    msg->length = data_size + 1;
+
+    // ==============================================
+    // 性能测试：记录发送开始时间
+    // ==============================================
+
+    long latency_us = 0;
+    // 获取高精度时间戳（纳秒级）
+    // clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+
+    // 发送消息并通知
+    if (client_ops.msg_send_and_notify(&amp_client, msg) != 0)
+    {
+        printf("error : msg send failed [offset = 0x%x, length = %u]\n", msg->offset, msg->length);
+        free(data_buffer);
+        return -1;
+    }
+
+    // ==============================================
+    // 性能测试：轮询计数和中间时间点
+    // ==============================================
+    int poll_count = 0;
+    struct timespec poll_start;
+    clock_gettime(CLOCK_MONOTONIC, &poll_start);
+    printf("poll start: %ld.%09ld\n", poll_start.tv_sec, poll_start.tv_nsec);
+    while(client_ops.msg_poll(msg) != 0) {
+        // 轮询等待响应
+        // poll_count++;
+        // if (poll_count <= 10) {  // 前10次轮询显示详细信息
+        //     // printf("[PERF] Polling attempt #%d...\n", poll_count);
+        // }
+        // if (poll_count % 100 == 0) {  // 每100次轮询显示一次
+        //     // printf("[PERF] Still polling... attempt #%d\n", poll_count);
+        // }
+        // sleep(3);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+
+    // 获取响应完成时间并计算延迟
+    
+    // 计算延迟（微秒）
+    latency_us = (end_time.tv_sec - start_time.tv_sec) * 1000000L + 
+                 (end_time.tv_nsec - start_time.tv_nsec) / 1000L;
+    
+    // 计算轮询时间
+    long poll_time_us = (end_time.tv_sec - poll_start.tv_sec) * 1000000L + 
+                        (end_time.tv_nsec - poll_start.tv_nsec) / 1000L;
+                        
+    printf("\n=== HYPERAMP PERFORMANCE RESULTS ===\n");
+    printf("[PERF] Total Round-Trip Latency: %ld μs (%.3f ms)\n", latency_us, latency_us / 1000.0);
+    printf("[PERF] Polling Time: %ld μs (%.3f ms)\n", poll_time_us, poll_time_us / 1000.0);
+    printf("[PERF] Throughput: %.2f bytes/sec\n", data_size * 1000000.0 / latency_us);
+    
+    // 性能评估
+    if (latency_us <= 10000) {  // 10ms
+        printf("[PERF] Latency Status: 🟢 EXCELLENT (≤10ms)\n");
+    } else if (latency_us <= 50000) {  // 50ms  
+        printf("[PERF] Latency Status: 🟡 GOOD (≤50ms)\n");
+    } else if (latency_us <= 100000) {  // 100ms
+        printf("[PERF] Latency Status: 🟠 ACCEPTABLE (≤100ms)\n");
+    } else {
+        printf("[PERF] Latency Status: 🔴 NEEDS OPTIMIZATION (>100ms)\n");
+    }
+    printf("=====================================\n\n");
+
+        // 读取处理后的结果数据
+    if (msg->flag.service_result == MSG_SERVICE_RET_SUCCESS) {
+        printf("=== HyperAMP Service Result ===\n");
+        
+        // 获取处理后的实际数据大小（可能与输入大小不同）
+        int result_data_size = msg->length > 0 ? msg->length - 1 : 0; // 减去末尾的 null terminator
+        if (result_data_size <= 0) {
+            result_data_size = data_size; // 回退到原始大小
+        }
+
+        if (service_id == 1) {
+            printf("Encryption completed. Encrypted data:\n");
+        } else if (service_id == 2) {
+            printf("Decryption completed. Decrypted data:\n");
+        } else {
+            printf("Service %u completed. Result data:\n", service_id);
+        }
+        // 确定显示长度：小于等于256字节全部显示，超过则显示前64字节
+        int display_length = result_data_size;
+        bool truncated = false;
+        if (result_data_size > 256) {
+            display_length = 64;
+            truncated = true;
+        }
+        
+        // 生成输出文件名
+        char output_filename[256];
+        if (service_id == 1) {
+            snprintf(output_filename, sizeof(output_filename), "encrypted_result.txt");
+        } else if (service_id == 2) {
+            snprintf(output_filename, sizeof(output_filename), "decrypted_result.txt");
+        } else {
+            snprintf(output_filename, sizeof(output_filename), "service_%u_result.txt", service_id);
+        }
+        
+        // 打开文件准备保存
+        FILE* output_file = fopen(output_filename, "wb");        
+        // 安全地显示处理后的数据 -使用动态显示长度
+        printf("Result: [");
+        for (int i = 0; i < display_length; i++) {
+            // 同时写入文件（如果文件打开成功）
+            if (output_file != NULL) {
+                fputc(shm_data[i], output_file);
+            }
+            
+            if (shm_data[i] >= 32 && shm_data[i] <= 126) {  // 可打印字符
+                printf("%c", shm_data[i]);
+            } else if (shm_data[i] == '\n') {  // 换行符特殊处理
+                printf("\\n");
+            } else if (shm_data[i] == '\r') {  // 回车符特殊处理
+                printf("\\r");
+            } else if (shm_data[i] == '\t') {  // 制表符特殊处理
+                printf("\\t");
+            } else {
+                printf("\\x%02x", (unsigned char)shm_data[i]);
+            }
+        }       
+        if (truncated) {
+            printf("... (showing first %d of %d bytes)", display_length, result_data_size);
+        }
+        printf("] (%d bytes)\n", result_data_size);
+        
+        // 显示十六进制格式 - 同样使用动态显示长度
+        printf("Hex format: ");
+        for (int i = 0; i < display_length; i++) {
+            printf("%02x", (unsigned char)shm_data[i]);
+        }
+        if (truncated) {
+            printf("... (showing first %d of %d bytes)", display_length, result_data_size);
+        }
+        printf("\n");
+        // 如果数据被截断，提示查看完整内容的方法
+        if (truncated) {
+            printf("Note: Large data truncated for display. Full data saved to file.\n");
+        }        
+        // 如果是加密服务，提供解密命令提示 - 添加安全检查，使用实际结果大小
+        if (service_id == 1 && result_data_size > 0 && result_data_size <= 64) {
+            printf("\nTo decrypt, use: ./hvisor shm hyper_amp_test %s hex:", shm_json_path);
+            for (int i = 0; i < result_data_size; i++) {
+                printf("%02x", (unsigned char)shm_data[i]);
+            }
+            printf(" 2\n");
+            printf("Or from file: ./hvisor shm hyper_amp_test %s @%s 2\n", shm_json_path, output_filename);
+        } else if (service_id == 1 && result_data_size > 64) {
+            printf("\nData too large for command line hex display. Use file input:\n");
+            printf("./hvisor shm hyper_amp_test %s @%s 2\n", shm_json_path, output_filename);
+        }
+        
+        printf("===============================\n");
+    } else {
+        printf("error : HyperAMP service failed [service_id = %u]\n", service_id);
+    }
+    
+    // 注意：跳过 shm_free 因为在 HVisor 环境中会导致段错误
+    // client_ops.shm_free(&amp_client, shm_data);
+    
+    printf("info : SHM test completed successfully\n");
+    
+    // 清理资源
+    client_ops.empty_msg_put(&amp_client, msg);
+    client_ops.client_destory(&amp_client);
+    
+    // 清理分配的数据缓冲区
+    free(data_buffer);
+    
+    return 0;
+}
+
+
 int main(int argc, char *argv[]) {
     int err = 0;
 
@@ -2671,8 +3273,8 @@ int main(int argc, char *argv[]) {
         else if(strcmp(argv[2], "hyper_amp_service") == 0) {
             // hvisor shm hyper_amp_service <shm_json_path>
             if (argc < 4) {
-                printf("Usage: hvisor shm hyper_amp_service <shm_json_path>\n");
-                printf("Example: hvisor shm hyper_amp_service /path/to/shm_config.json\n");
+                printf("Usage: ./hvisor shm hyper_amp_service <shm_json_path>\n");
+                printf("Example: ./hvisor shm hyper_amp_service /path/to/shm_config.json\n");
                 help(1);
             }
             hyper_amp_service(argv[3]);
@@ -2680,13 +3282,33 @@ int main(int argc, char *argv[]) {
         else if(strcmp(argv[2], "hyper_amp") == 0) {
             // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>
             if (argc < 5) {
-                printf("Usage: hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Usage: ./hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
                 printf("Examples:\n");
-                printf("  hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
-                printf("  hvisor shm hyper_amp shm_config.json @data.txt 2\n");
+                printf("  ./hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
+                printf("  ./hvisor shm hyper_amp shm_config.json @data.txt 2\n");
                 return -1;
             }
             hyper_amp_client(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "hyper_amp_service_test") == 0) {
+            // hvisor shm hyper_amp_service <shm_json_path>
+            if (argc < 4) {
+                printf("Usage: ./hvisor shm hyper_amp_service_test <shm_json_path>\n");
+                printf("Example: ./hvisor shm hyper_amp_service_test shm_config.json\n");
+                help(1);
+            }
+            hyper_amp_service_test(argv[3]);
+        }
+        else if(strcmp(argv[2], "hyper_amp_test") == 0) {
+            // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>
+            if (argc < 5) {
+                printf("Usage: ./hvisor shm hyper_amp_test <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Examples:\n");
+                printf("  ./hvisor shm hyper_amp_test shm_config.json \"hello world\" 1\n");
+                printf("  ./hvisor shm hyper_amp_test shm_config.json @data.txt 2\n");
+                return -1;
+            }
+            hyper_amp_client_test(argc - 3, &argv[3]);
         } 
         else {
             help(1);

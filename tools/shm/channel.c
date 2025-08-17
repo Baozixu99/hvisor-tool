@@ -15,13 +15,12 @@
 #include "shm/channel.h"
 #include "shm/msgqueue.h"
 #include "hvisor.h"
-
+#include "shm/time_utils.h" 
 /* 通道初始化只能由一个任务(线程)完成 */
 // TODO: for multi-task, add lock
 // static volatile uint32_t channel_init_mark = INIT_MARK_RAW_STATE;
 static int mem_fd = -1;
 static int hvisor_fd = -1;
-
 // TODO: add channel mutex init
 struct Channel channels[] = 
 {
@@ -57,6 +56,7 @@ static channel_request(__u64 target_zone_id,
     printf("debug:args.target_zone_id = %ld,args.service_id = %ld,args.swi = %ld\n",args.target_zone_id,args.service_id,args.swi);
 
     int fd = open_hvisor_dev();
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
     int ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
     if (ret < 0) {
         perror("end_exception_trace: ioctl failed");
@@ -473,6 +473,8 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
  
     // printf("dst_zone_id = %u, service_id = %u\n", channel->channel_info->dst_zone->id, msg->service_id);
     //arm swi = 74
+  
+
     channel_request(channel->channel_info->dst_zone->id, msg->service_id, 74);
 
     // TODO: add a inter-zone mutex lock and unlock (autually, wait_lock is just enough!)
