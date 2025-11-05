@@ -35,7 +35,8 @@
 #include <sys/ioctl.h>
 #include "shm/addr.h"
 #include "shm/config/config_addr.h"
-#include "shm/time_utils.h" 
+#include "shm/time_utils.h"
+#include "hyper_amp_qos.h"  // QoS模块
 
 // Global variables for signal handling
 static volatile int running = 1;
@@ -74,6 +75,17 @@ static void __attribute__((noreturn)) help(int exit_status) {
     printf("  HyperAMP service : ./hvisor shm hyper_amp_service shm_config.json\n");
     printf("HyperAMP client performance testing: ./hvisor shm hyper_amp_test shm_config.json \"hello\" 1\n");
     printf("HyperAMP service performance testing: ./hvisor shm hyper_amp_service_test shm_config.json\n");
+    printf("\n");
+    printf("QoS-Enabled HyperAMP Commands:\n");
+    printf("  ./hvisor shm hyper_amp_qos <config> <data> <svc_id>  - QoS-aware client\n");
+    printf("  ./hvisor shm hyper_amp_qos_service <config>          - QoS-aware server\n");
+    printf("  ./hvisor shm qos_stats                               - Show QoS statistics\n");
+    printf("\n");
+    printf("QoS Features:\n");
+    printf("  - Automatic service classification (REALTIME/THROUGHPUT/RELIABLE/BEST_EFFORT)\n");
+    printf("  - Three-phase batch processing (Collect → Schedule → Cleanup)\n");
+    printf("  - WRR priority scheduling with latency tracking\n");
+    printf("  - QoS violation detection and reporting\n");
     exit(exit_status);
 }
 
@@ -867,7 +879,8 @@ static int test_shm_signal(int argc, char *argv[]) {
  * AES-like 加密函数 (简化版) - Service ID 1
  * 使用简单的字节替换和位移操作模拟AES加密
  */
-static int hyperamp_encrypt_service(char* data, int data_len, int max_len) {
+// HyperAMP加密服务实现（简单XOR加密）- 导出给QoS模块使用
+int hyperamp_encrypt_service(char* data, int data_len, int max_len) {
     if (data == NULL || data_len <= 0 || max_len <= 0) {
         return -1;
     }
@@ -917,7 +930,8 @@ static int hyperamp_encrypt_service(char* data, int data_len, int max_len) {
  * AES-like 解密函数 (简化版) - Service ID 2  
  * 对应加密函数的逆向操作
  */
-static int hyperamp_decrypt_service(char* data, int data_len, int max_len) {
+// HyperAMP解密服务实现（简单XOR解密）- 导出给QoS模块使用
+int hyperamp_decrypt_service(char* data, int data_len, int max_len) {
     if (data == NULL || data_len <= 0 || max_len <= 0) {
         return -1;
     }
@@ -3309,7 +3323,49 @@ int main(int argc, char *argv[]) {
                 return -1;
             }
             hyper_amp_client_test(argc - 3, &argv[3]);
-        } 
+        }
+        // ========== QoS命令 ==========
+        else if(strcmp(argv[2], "hyper_amp_qos") == 0) {
+            // hvisor shm hyper_amp_qos <shm_json_path> <data|@filename> <service_id>
+            if (argc < 5) {
+                printf("Usage: ./hvisor shm hyper_amp_qos <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Examples:\n");
+                printf("  ./hvisor shm hyper_amp_qos shm_config.json \"hello world\" 1\n");
+                printf("  ./hvisor shm hyper_amp_qos shm_config.json @data.txt 2\n");
+                printf("\nFeatures:\n");
+                printf("  - Automatic QoS classification (REALTIME/THROUGHPUT/RELIABLE/BEST_EFFORT)\n");
+                printf("  - Latency tracking and violation detection\n");
+                printf("  - Performance statistics\n");
+                return -1;
+            }
+            // 解析参数
+            char* shm_json = argv[3];
+            char* data_input = argv[4];
+            uint32_t service_id = (uint32_t)atoi(argv[5]);
+            
+            err = hyper_amp_qos_client(shm_json, data_input, service_id);
+        }
+        else if(strcmp(argv[2], "hyper_amp_qos_service") == 0) {
+            // hvisor shm hyper_amp_qos_service <shm_json_path>
+            if (argc < 4) {
+                printf("Usage: ./hvisor shm hyper_amp_qos_service <shm_json_path>\n");
+                printf("Example: ./hvisor shm hyper_amp_qos_service shm_config.json\n");
+                printf("\nFeatures:\n");
+                printf("  - Three-phase batch processing\n");
+                printf("  - WRR (Weighted Round Robin) scheduling\n");
+                printf("  - Priority-based message processing\n");
+                printf("  - Circular reference detection\n");
+                printf("  - NULL safety checks\n");
+                return -1;
+            }
+            err = hyper_amp_qos_service(argv[3]);
+        }
+        else if(strcmp(argv[2], "qos_stats") == 0) {
+            // P0修复: 添加qos_stats命令
+            // hvisor shm qos_stats
+            printf("[QoS-Stats] Printing QoS statistics...\n");
+            err = hyper_amp_qos_print_stats();
+        }
         else {
             help(1);
         }

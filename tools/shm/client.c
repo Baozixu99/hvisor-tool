@@ -72,7 +72,7 @@ static int32_t client_init(struct Client* raw_client, uint32_t remote_zone_id)
       if (mem_fd >= 0) {
           // 映射 Non-Root Linux 的消息队列 (addr_infos[2] = zonex_ram_ipa)
           dst_queue_virt = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, mem_fd, 0x7e410000);  // zonex_ram_ipa
+                               MAP_SHARED, mem_fd, 0xde410000);  // zonex_ram_ipa
           if (dst_queue_virt != MAP_FAILED) {
               printf("Mapped target zone queue at: %p\n", dst_queue_virt);
           } else {
