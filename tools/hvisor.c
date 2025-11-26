@@ -36,6 +36,7 @@
 #include "shm/addr.h"
 #include "shm/config/config_addr.h"
 #include "shm/time_utils.h"
+#include "shm/precision_timer.h"  // 高精度 ARM64 计时器
 #include "hyper_amp_qos.h"  // QoS模块
 
 // Global variables for signal handling
@@ -2608,6 +2609,18 @@ static int hyper_amp_service_test(char* shm_json_path) {
     printf("=== Non-Root Linux SHM Read Test ===\n");
     printf("Initializing as SHM server to read client data...\n");
     
+    // 打开性能日志文件
+    FILE* perf_log = fopen("service_performance.log", "w");
+    if (perf_log == NULL) {
+        printf("[Warning] Failed to open performance log file: %s\n", strerror(errno));
+        printf("[Info] Performance data will not be saved to file\n");
+    } else {
+        // 写入表头
+        fprintf(perf_log, "Message编号\t服务处理时间\n");
+        fflush(perf_log);
+        printf("[Info] Performance log file created: service_performance.log\n");
+    }
+    
     // step 1: 解析地址配置 (从JSON获取动态地址)
     parse_global_addr(shm_json_path);
     printf("[Test] Address configuration parsed\n");
@@ -2763,17 +2776,29 @@ static int hyper_amp_service_test(char* shm_json_path) {
     
     int msg_count = 0;
     int check_counter = 0;
+    
+    // 获取 ARM64 计时器频率
+    uint64_t timer_freq = get_cntfrq();
+    printf("[PERF] ARM64 Timer Frequency: %lu Hz (%.2f MHz)\n", 
+           timer_freq, timer_freq / 1000000.0);
+    printf("[PERF] Timer Precision: %.2f ns per tick\n\n", 
+           get_timer_precision_ns(timer_freq));
 
-    while (running && msg_count < 100) {
+    while (running) {
         bool should_check_messages = false;
+        uint64_t service_ticks_start = 0;  // 服务端接收中断的时间戳
         
         // 如果有中断设备，先检查中断
         if (shm_fd >= 0) {
             int ret = poll(&pfd, 1, -1); // 程序阻塞，等待中断
-            clock_gettime(CLOCK_MONOTONIC, &service_start_time);
+            
+            // 记录服务端接收到中断的时间戳（使用高精度计时器）
+            service_ticks_start = get_cntpct();
+            
             if (ret > 0 && (pfd.revents & POLLIN)) {//PLOLLIN事件chunk
                 printf("\033[2K\r");  // 清除当前行并回到行首
-                printf("[Test] SHM interrupt received, checking for messages...\n");
+                printf("[Test] SHM interrupt received (tick=%lu), checking for messages...\n", 
+                       service_ticks_start);
                 should_check_messages = true;
 
             }
@@ -2900,22 +2925,36 @@ static int hyper_amp_service_test(char* shm_json_path) {
                 printf("    Updated Root Linux proc_ing_h: %u -> %u\n", head, new_head);
                 printf("    Reset working_mark to IDLE (0x%x)\n", MSG_QUEUE_MARK_IDLE);
                 printf("    Root Linux should now detect the state change and stop polling\n");
+                
                 // ==============================================
-                // 性能测试：记录服务端处理结束时间并计算处理时长
+                // 高精度性能测试：记录服务端处理结束时间并计算处理时长
                 // ==============================================
-                clock_gettime(CLOCK_MONOTONIC, &service_end_time);
+                uint64_t service_ticks_end = get_cntpct();
+                
+                uint64_t service_time_us = ticks_to_us(service_ticks_start, service_ticks_end, timer_freq);
+                uint64_t service_time_ns = ticks_to_ns(service_ticks_start, service_ticks_end, timer_freq);
                     
-                long service_time_us = (service_end_time.tv_sec - service_start_time.tv_sec) * 1000000L + 
-                                          (service_end_time.tv_nsec - service_start_time.tv_nsec) / 1000L;
-                    
-                printf("\n=== HYPERAMP SERVICE PERFORMANCE ===\n");
-                printf("[PERF-SERVICE] Processing Time: %ld μs (%.3f ms)\n", 
-                           service_time_us, service_time_us / 1000.0);
+                printf("\n=== HYPERAMP SERVICE HIGH-PRECISION PERFORMANCE ===\n");
+                printf("[PERF-SERVICE] Processing Time: %lu μs (%.3f ms) [%lu ns]\n", 
+                       service_time_us, service_time_us / 1000.0, service_time_ns);
                 printf("[PERF-SERVICE] Message Size: %u bytes\n", msg->length);
                 printf("[PERF-SERVICE] Service ID: %u\n", msg->service_id);
-                printf("[PERF-SERVICE] Throughput: %.2f bytes/sec\n", 
-                           msg->length * 1000000.0 / service_time_us);
-                printf("=====================================\n\n");
+                if (service_time_us > 0) {
+                    printf("[PERF-SERVICE] Throughput: %.2f bytes/sec (%.2f KB/sec)\n", 
+                           msg->length * 1000000.0 / service_time_us,
+                           msg->length * 1000.0 / service_time_us);
+                }
+                printf("[PERF-SERVICE] Ticks: start=%lu, end=%lu, diff=%lu\n",
+                       service_ticks_start, service_ticks_end, 
+                       service_ticks_end - service_ticks_start);
+                printf("===================================================\n\n");
+                
+                // 保存性能数据到文件
+                if (perf_log != NULL) {
+                    fprintf(perf_log, "%d\t%.3f ms\n", msg_count, service_time_us / 1000.0);
+                    fflush(perf_log);  // 立即刷新到文件
+                }
+                
                 printf("    *** HYPERAMP SERVICE COMPLETED! ***\n");
             }
             if (!found_message && check_counter % 50 == 0) {
@@ -2927,10 +2966,15 @@ static int hyper_amp_service_test(char* shm_json_path) {
             }
         }
         
-        // usleep(100000); // 100ms
     }
     
     printf("\n[Test] SHM read test completed. Processed %d messages.\n", msg_count);
+    
+    // 关闭性能日志文件
+    if (perf_log != NULL) {
+        fclose(perf_log);
+        printf("[Info] Performance data saved to service_performance.log\n");
+    }
     
     // step 8: 清理资源
     if (shm_fd >= 0) {
@@ -3022,13 +3066,18 @@ static int hyper_amp_client_test(int argc, char* argv[]) {
     msg->length = data_size + 1;
 
     // ==============================================
-    // 性能测试：记录发送开始时间
+    // 高精度性能测试：使用 ARM64 System Counter
     // ==============================================
-
-    long latency_us = 0;
-    // 获取高精度时间戳（纳秒级）
-    // clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    
+    // 获取计数器频率（只需读取一次）
+    uint64_t timer_freq = get_cntfrq();
+    printf("\n[PERF] ARM64 Timer Frequency: %lu Hz (%.2f MHz)\n", 
+           timer_freq, timer_freq / 1000000.0);
+    printf("[PERF] Timer Precision: %.2f ns per tick\n", 
+           get_timer_precision_ns(timer_freq));
+    
+    // 记录发送前的时间戳（硬件计数器）
+    uint64_t ticks_start = get_cntpct();
 
     // 发送消息并通知
     if (client_ops.msg_send_and_notify(&amp_client, msg) != 0)
@@ -3041,37 +3090,47 @@ static int hyper_amp_client_test(int argc, char* argv[]) {
     // ==============================================
     // 性能测试：轮询计数和中间时间点
     // ==============================================
+    uint64_t ticks_poll_start = get_cntpct();
     int poll_count = 0;
-    struct timespec poll_start;
-    clock_gettime(CLOCK_MONOTONIC, &poll_start);
-    printf("poll start: %ld.%09ld\n", poll_start.tv_sec, poll_start.tv_nsec);
+    
     while(client_ops.msg_poll(msg) != 0) {
         // 轮询等待响应
-        // poll_count++;
-        // if (poll_count <= 10) {  // 前10次轮询显示详细信息
-        //     // printf("[PERF] Polling attempt #%d...\n", poll_count);
-        // }
-        // if (poll_count % 100 == 0) {  // 每100次轮询显示一次
-        //     // printf("[PERF] Still polling... attempt #%d\n", poll_count);
-        // }
-        // sleep(3);
+        poll_count++;
     }
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    
+    // 记录响应接收完成的时间戳
+    uint64_t ticks_end = get_cntpct();
 
-    // 获取响应完成时间并计算延迟
+    // 计算各项延迟（微秒）
+    uint64_t latency_us = ticks_to_us(ticks_start, ticks_end, timer_freq);
+    uint64_t poll_time_us = ticks_to_us(ticks_poll_start, ticks_end, timer_freq);
+    uint64_t send_to_poll_us = ticks_to_us(ticks_start, ticks_poll_start, timer_freq);
     
-    // 计算延迟（微秒）
-    latency_us = (end_time.tv_sec - start_time.tv_sec) * 1000000L + 
-                 (end_time.tv_nsec - start_time.tv_nsec) / 1000L;
-    
-    // 计算轮询时间
-    long poll_time_us = (end_time.tv_sec - poll_start.tv_sec) * 1000000L + 
-                        (end_time.tv_nsec - poll_start.tv_nsec) / 1000L;
+    // 计算纳秒级延迟（更高精度）
+    uint64_t latency_ns = ticks_to_ns(ticks_start, ticks_end, timer_freq);
                         
-    printf("\n=== HYPERAMP PERFORMANCE RESULTS ===\n");
-    printf("[PERF] Total Round-Trip Latency: %ld μs (%.3f ms)\n", latency_us, latency_us / 1000.0);
-    printf("[PERF] Polling Time: %ld μs (%.3f ms)\n", poll_time_us, poll_time_us / 1000.0);
-    printf("[PERF] Throughput: %.2f bytes/sec\n", data_size * 1000000.0 / latency_us);
+    printf("\n=== HYPERAMP HIGH-PRECISION PERFORMANCE RESULTS ===\n");
+    printf("[PERF] Total Round-Trip Latency: %lu μs (%.3f ms) [%lu ns]\n", 
+           latency_us, latency_us / 1000.0, latency_ns);
+    printf("[PERF] Send-to-Poll Time: %lu μs (%.3f ms)\n", 
+           send_to_poll_us, send_to_poll_us / 1000.0);
+    printf("[PERF] Polling Time: %lu μs (%.3f ms)\n", 
+           poll_time_us, poll_time_us / 1000.0);
+    printf("[PERF] Poll Count: %d iterations\n", poll_count);
+    
+    // 计算吞吐量
+    if (latency_us > 0) {
+        printf("[PERF] Throughput: %.2f bytes/sec (%.2f KB/sec)\n", 
+               data_size * 1000000.0 / latency_us,
+               data_size * 1000.0 / latency_us);
+    }
+    
+    // 计算 ticks 信息（调试用）
+    printf("[PERF] Ticks: start=%lu, end=%lu, diff=%lu\n",
+           ticks_start, ticks_end, ticks_end - ticks_start);
+    // 计算 ticks 信息（调试用）
+    printf("[PERF] Ticks: start=%lu, end=%lu, diff=%lu\n",
+           ticks_start, ticks_end, ticks_end - ticks_start);
     
     // 性能评估
     if (latency_us <= 10000) {  // 10ms
@@ -3083,7 +3142,7 @@ static int hyper_amp_client_test(int argc, char* argv[]) {
     } else {
         printf("[PERF] Latency Status: 🔴 NEEDS OPTIMIZATION (>100ms)\n");
     }
-    printf("=====================================\n\n");
+    printf("===================================================\n\n");
 
         // 读取处理后的结果数据
     if (msg->flag.service_result == MSG_SERVICE_RET_SUCCESS) {
