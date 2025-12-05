@@ -115,6 +115,9 @@ static int32_t msg_queue_init(struct AmpMsgQueue* msg_queue, uint32_t mem_len)
   msg_queue->proc_ing_h = buf_size; /* 正在处理的消息队列为空 */
   msg_queue->buf_size = buf_size; /* 标记该消息队列可用 */
   
+  /* 初始化队列锁 (用于多线程安全) */
+  byte_flag_ops.init(&msg_queue->queue_lock);
+  
   // printf("buffer_queue_init_success: mem_len = %u, infos_length = %u, buf_length = %u, buf_size = %u, unused = %u\n",
   //   mem_len, infos_length, buf_length, buf_size,
   //   mem_len - infos_length - buf_length * buf_size);
@@ -137,11 +140,15 @@ static uint16_t msg_queue_pop(struct AmpMsgQueue* msg_queue, uint16_t* head)
 {
   uint16_t ret = msg_queue->buf_size;
 
+  /* 加锁保护队列操作 */
+  byte_flag_ops.lock(&msg_queue->queue_lock);
+
   if (*head >= msg_queue->buf_size) 
   {
     /* 链空 */
     // printf("msg_queue_pop_warn: have no more msg, end = %u, msg_queue->buf_size = %u\n", 
     //     *head, msg_queue->buf_size);
+    byte_flag_ops.unlock(&msg_queue->queue_lock);
     return ret;
   }
   
@@ -149,6 +156,8 @@ static uint16_t msg_queue_pop(struct AmpMsgQueue* msg_queue, uint16_t* head)
   ret = *head;
   *head = msg_queue->entries[*head].nxt_idx;
   msg_queue->entries[ret].nxt_idx = msg_queue->buf_size;
+
+  byte_flag_ops.unlock(&msg_queue->queue_lock);
 
   // printf("msg_queue_pop_success: pop msg index = %u\n",ret);
 
@@ -159,9 +168,13 @@ static int32_t msg_queue_push(struct AmpMsgQueue* msg_queue, uint16_t* head, uin
 {
   // printf("msg_queue_push_info: enter\n");
 
+  /* 加锁保护队列操作 */
+  byte_flag_ops.lock(&msg_queue->queue_lock);
+
   if (msg_index >= msg_queue->buf_size)
   {
       printf("msg_queue_push_error: msg index error = %u, check it\n",msg_index);
+      byte_flag_ops.unlock(&msg_queue->queue_lock);
       while(1) {}
   }
   
@@ -177,6 +190,8 @@ static int32_t msg_queue_push(struct AmpMsgQueue* msg_queue, uint16_t* head, uin
       *head = msg_index;
   }
   
+  byte_flag_ops.unlock(&msg_queue->queue_lock);
+  
   // printf("msg_queue_push_success: msg index = %u\n", msg_index);
 
   return 0;
@@ -186,15 +201,22 @@ static int32_t msg_queue_transfer(struct AmpMsgQueue* msg_queue,
   uint16_t* from_head, uint16_t* to_head)
 {
   // printf("msg_queue_transfer_info: enter\n");
+  
+  /* 加锁保护队列操作 */
+  byte_flag_ops.lock(&msg_queue->queue_lock);
+  
   if (*from_head >= msg_queue->buf_size)
   {
       printf("msg_queue_transfer_error: from_head error = %u, check it\n", 
         *from_head);
+      byte_flag_ops.unlock(&msg_queue->queue_lock);
       while(1) {}
   }
   
   *to_head = *from_head;
   *from_head = msg_queue->buf_size;
+
+  byte_flag_ops.unlock(&msg_queue->queue_lock);
 
   // printf("msg_queue_transfer_info: from_head = %u, to_head = %u\n",
   //   *from_head, *to_head);

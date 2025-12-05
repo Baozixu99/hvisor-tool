@@ -41,6 +41,8 @@ struct AmpMsgQueue
 	volatile uint16_t wait_h;  /* 待处理缓冲区链头下标 */
 	volatile uint16_t proc_ing_h; /* 服务端正在处理的缓冲区链头下标 */
 
+	ByteFlag queue_lock;  /* 队列操作锁 (用于多线程安全) */
+
 	struct MsgEntry entries[0];   /* 实际存放的消息 */
 }__attribute__((aligned(MEMORY_ALIGN_SIZE)));
 

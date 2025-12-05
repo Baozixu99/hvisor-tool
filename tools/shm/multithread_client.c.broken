@@ -1,0 +1,320 @@
+/**
+ * HyperAMP 多线程客户端实现
+ * 
+ * 使用线程池并发发送多个请求,测试系统的并发处理能力
+ */
+    // 3. 分配共享内存
+    char* shm_data =    // 6. 发送消息并通知(队列操作已加锁保护)
+    struct timespec send_time, recv_time;
+    clock_gettime(CLOCK_MONOTONIC, &send_time);
+    
+    if (client_ops.msg_send_and_notify(amp_client, msg) != 0) {
+        printf("[Thread %ld] ❌ ERROR: msg send failed [offset = 0x%x]\n", 
+               pthread_self(), msg->offset);
+        goto cleanup;
+    }
+    
+    // 7. 轮询等待响应ent_ops.shm_malloc(amp_client, request->size + 1, MALLOC_TYPE_P);
+    if (shm_data == NULL) {
+        shm_data = (char*)client_ops.shm_malloc(amp_client, request->size + 1, MALLOC_TYPE_V);
+    }
+    if (shm_data == NULL) {
+        printf("[Thread %ld] ❌ ERROR: shm malloc failed [size = %u]\n", 
+               pthread_self(), request->size + 1);
+        goto cleanup;
+    }
+    
+    // 4. 逐字节拷贝数据到共享内存(避免总线错误)
+    for (uint32_t i = 0; i < request->size; i++) {
+        shm_data[i] = request->data_string[i];
+    }
+    shm_data[request->size] = '\0';
+    
+    // 5. 设置消息参数>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+#include "shm/shm.h"
+#include "shm/msg.h"
+#include "shm/client.h"
+#include "shm/threads.h"
+#include "shm/config/config_addr.h"
+#include "shm/config/config_zone.h"
+#include "shm/multithread_client.h"
+
+// ==============================================
+// 客户端请求结构定义
+// ==============================================
+
+typedef struct ClientRequest {
+    uint32_t request_id;      // 请求ID
+    uint32_t service_id;      // 服务ID
+    char* data_string;        // 请求数据
+    uint32_t size;            // 数据大小
+    struct Client* amp_client; // 客户端指针(所有线程共享)
+} ClientRequest;
+
+// ==============================================
+// 工作线程处理函数
+// ==============================================
+
+/**
+ * 处理单个客户端请求
+ * 
+ * @param arg1 ClientRequest* 请求结构
+ * @param arg2 struct Msg* 消息结构(线程独占)
+ */
+static void handle_client_request(void* arg1, void* arg2) {
+    ClientRequest* request = (ClientRequest*)arg1;
+    struct Msg* msg = (struct Msg*)arg2;
+    struct Client* amp_client = request->amp_client;
+    
+    if (amp_client == NULL) {
+        printf("[Thread %ld] ❌ ERROR: Client context not found!\n", pthread_self());
+        goto cleanup;
+    }
+    
+    printf("[Thread %ld] 📨 Processing request #%u: service=%u, data=\"%s\" (%u bytes)\n",
+           pthread_self(), request->request_id, request->service_id, 
+           request->data_string, request->size);
+    
+    // 1. 设置消息的service_id(重要!修复Bug #3)
+    msg->service_id = request->service_id;
+    
+    // 2. 重置消息
+    msg_ops.msg_reset(msg);
+    
+    // 3. 分配共享内存
+    char* shm_data = (char*)client_ops.shm_malloc(amp_client, request->size + 1, MALLOC_TYPE_P);
+    if (shm_data == NULL) {
+        shm_data = (char*)client_ops.shm_malloc(amp_client, request->size + 1, MALLOC_TYPE_V);
+    }
+    if (shm_data == NULL) {
+        printf("[Thread %ld] ❌ ERROR: shm malloc failed [size = %u]\n", 
+               pthread_self(), request->size + 1);
+        goto cleanup;
+    }
+    
+    // 4. 逐字节拷贝数据到共享内存(避免总线错误)
+    for (uint32_t i = 0; i < request->size; i++) {
+        shm_data[i] = request->data_string[i];
+    }
+    shm_data[request->size] = '\0';
+    
+    // 5. 设置消息参数
+    msg->offset = client_ops.shm_addr_to_offset(shm_data);
+    msg->length = request->size + 1;
+    
+    // 6. 发送消息并通知(队列操作已加锁保护)
+    struct timespec send_time, recv_time;
+    clock_gettime(CLOCK_MONOTONIC, &send_time);
+    
+    if (client_ops.msg_send_and_notify(amp_client, msg) != 0) {
+        printf("[Thread %ld] ❌ ERROR: msg send failed [offset = 0x%x]\n", 
+               pthread_self(), msg->offset);
+        goto cleanup;
+    }
+    
+    // 7. 轮询等待响应
+    while (client_ops.msg_poll(msg) != 0) {
+        usleep(100);  // 微睡眠减少CPU占用
+    }
+    
+    clock_gettime(CLOCK_MONOTONIC, &recv_time);
+    long latency_us = (recv_time.tv_sec - send_time.tv_sec) * 1000000L + 
+                      (recv_time.tv_nsec - send_time.tv_nsec) / 1000L;
+    
+    // 8. 检查处理结果
+    if (msg->flag.service_result == MSG_SERVICE_RET_SUCCESS) {
+        printf("[Thread %ld] ✅ Request #%u SUCCESS - Latency: %ld μs (%.3f ms)\n",
+               pthread_self(), request->request_id, latency_us, latency_us / 1000.0);
+        
+        // 显示响应数据(限制显示长度避免刷屏)
+        int display_len = (msg->length - 1 < 64) ? msg->length - 1 : 64;
+        printf("[Thread %ld] Response: [", pthread_self());
+        for (int i = 0; i < display_len; i++) {
+            if (shm_data[i] >= 32 && shm_data[i] <= 126) {
+                printf("%c", shm_data[i]);
+            } else {
+                printf("\\x%02x", (unsigned char)shm_data[i]);
+            }
+        }
+        if ((int)(msg->length - 1) > 64) printf("...");
+        printf("]\n");
+    } else {
+        printf("[Thread %ld] ❌ Request #%u FAILED [service_result = %u]\n", 
+               pthread_self(), request->request_id, msg->flag.service_result);
+    }
+    
+    // 9. 释放共享内存 (重要!避免内存泄漏)
+    if (shm_data != NULL) {
+        client_ops.shm_free(amp_client, shm_data);
+    }
+    
+cleanup:
+    // 清理请求资源
+    if (request->data_string) free(request->data_string);
+    free(request);
+}
+
+// ==============================================
+// 多线程客户端测试主函数
+// ==============================================
+
+int hyper_amp_client_test_multithread(int argc, char* argv[]) {
+    if (argc < 4) {
+        printf("Usage: ./hvisor shm hyper_amp_test_mt <config> <data> <service_id> <threads> [total_requests]\n");
+        printf("\n");
+        printf("Parameters:\n");
+        printf("  config          - SHM configuration file (e.g., shm_config.json)\n");
+        printf("  data            - Data to send\n");
+        printf("  service_id      - Service ID (1=encrypt, 2=decrypt, 66=echo)\n");
+        printf("  threads         - Number of worker threads (1-64)\n");
+        printf("  total_requests  - Total requests to send (default: threads)\n");
+        printf("\n");
+        printf("Examples:\n");
+        printf("  ./hvisor shm hyper_amp_test_mt shm_config.json \"hello\" 1 4\n");
+        printf("  ./hvisor shm hyper_amp_test_mt shm_config.json \"test\" 1 8 100\n");
+        printf("  ./hvisor shm hyper_amp_test_mt shm_config.json \"data\" 66 16 1000\n");
+        return -1;
+    }
+    
+    char* config = argv[0];
+    char* data_input = argv[1];
+    uint32_t service_id = strtoul(argv[2], NULL, 10);
+    int num_threads = atoi(argv[3]);
+    int num_requests = (argc >= 5) ? atoi(argv[4]) : num_threads;  // 默认每线程一个请求
+    
+    // 参数校验
+    if (num_threads <= 0 || num_threads > 64) {
+        printf("❌ ERROR: Invalid thread count %d (must be 1-64)\n", num_threads);
+        return -1;
+    }
+    
+    if (num_requests <= 0 || num_requests > 10000) {
+        printf("❌ ERROR: Invalid request count %d (must be 1-10000)\n", num_requests);
+        return -1;
+    }
+    
+    // 显示测试配置
+    printf("\n");
+    printf("╔════════════════════════════════════════════════════════╗\n");
+    printf("║     HyperAMP Multi-threaded Client Test               ║\n");
+    printf("╠════════════════════════════════════════════════════════╣\n");
+    printf("║ Configuration: %-39s ║\n", config);
+    printf("║ Data:          \"%-37s\" ║\n", data_input);
+    printf("║ Data Size:     %-3zu bytes                             ║\n", strlen(data_input));
+    printf("║ Service ID:    %-3u                                     ║\n", service_id);
+    printf("║ Threads:       %-3d workers                            ║\n", num_threads);
+    printf("║ Total Requests:%-5d                                   ║\n", num_requests);
+    printf("╚════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+    
+    // 1. 初始化全局地址配置
+    parse_global_addr(config);
+    
+    // 2. 初始化共享客户端
+    struct Client* amp_client = malloc(sizeof(struct Client));
+    if (amp_client == NULL) {
+        printf("❌ ERROR: Failed to allocate client\n");
+        return -1;
+    }
+    
+    if (client_ops.client_init(amp_client, ZONE_NPUcore_ID) != 0) {
+        printf("❌ ERROR: Client init failed\n");
+        free(amp_client);
+        return -1;
+    }
+    printf("✅ Client initialized (Zone: NPUcore)\n");
+    
+    // 3. 创建线程池
+    ThreadPool* pool = init_thread_pool(num_threads, amp_client);
+    if (pool == NULL) {
+        printf("❌ ERROR: Failed to create thread pool\n");
+        client_ops.client_destory(amp_client);
+        free(amp_client);
+        return -1;
+    }
+    printf("✅ Thread pool created (%d workers)\n", num_threads);
+    
+    // 4. 提交任务到线程池
+    struct timespec test_start, test_end;
+    clock_gettime(CLOCK_MONOTONIC, &test_start);
+    
+    printf("\n📤 Submitting %d requests to thread pool...\n", num_requests);
+    int submitted = 0;
+    for (int i = 0; i < num_requests; i++) {
+        ClientRequest* req = malloc(sizeof(ClientRequest));
+        if (req == NULL) {
+            printf("⚠️  WARNING: Failed to allocate request #%d\n", i + 1);
+            continue;
+        }
+        
+        req->request_id = i + 1;
+        req->service_id = service_id;
+        req->size = strlen(data_input);
+        req->data_string = strdup(data_input);
+        req->amp_client = amp_client;  // 传递共享客户端指针
+        
+        if (req->data_string == NULL) {
+            printf("⚠️  WARNING: Failed to duplicate data for request #%d\n", i + 1);
+            free(req);
+            continue;
+        }
+        
+        add_task(pool, handle_client_request, req);
+        submitted++;
+    }
+    printf("✅ Submitted %d/%d requests\n", submitted, num_requests);
+    
+    // 5. 等待所有任务完成
+    printf("\n⏳ Waiting for all requests to complete...\n");
+    while (!task_queue_is_empty(pool)) {
+        usleep(100000);  // 100ms检查一次,避免CPU空转
+    }
+    
+    // 额外等待一小段时间,确保最后的任务完全处理完毕
+    usleep(500000);  // 等待500ms确保所有线程都完成清理
+    
+    clock_gettime(CLOCK_MONOTONIC, &test_end);
+    long total_time_us = (test_end.tv_sec - test_start.tv_sec) * 1000000L + 
+                         (test_end.tv_nsec - test_start.tv_nsec) / 1000L;
+    
+    // 6. 显示性能统计
+    printf("\n");
+    printf("╔════════════════════════════════════════════════════════╗\n");
+    printf("║              Performance Summary                       ║\n");
+    printf("╠════════════════════════════════════════════════════════╣\n");
+    printf("║ Total Time:        %8ld μs (%7.3f ms)           ║\n", 
+           total_time_us, total_time_us / 1000.0);
+    printf("║ Throughput:        %8.2f requests/sec              ║\n", 
+           submitted * 1000000.0 / total_time_us);
+    printf("║ Avg Latency:       %8.2f μs per request            ║\n", 
+           (double)total_time_us / submitted);
+    printf("║ Threads Used:      %8d workers                     ║\n", num_threads);
+    printf("║ Completed:         %8d/%d requests                ║\n", submitted, num_requests);
+    
+    // 性能评估
+    double throughput = submitted * 1000000.0 / total_time_us;
+    if (throughput >= 100) {
+        printf("║ Status:            🟢 EXCELLENT (≥100 req/s)          ║\n");
+    } else if (throughput >= 50) {
+        printf("║ Status:            🟡 GOOD (≥50 req/s)                ║\n");
+    } else if (throughput >= 10) {
+        printf("║ Status:            🟠 ACCEPTABLE (≥10 req/s)          ║\n");
+    } else {
+        printf("║ Status:            🔴 NEEDS OPTIMIZATION (<10 req/s)  ║\n");
+    }
+    printf("╚════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+    
+    // 7. 清理资源
+    destroy_thread_pool(pool);
+    client_ops.client_destory(amp_client);
+    free(amp_client);
+    
+    printf("✅ Multi-threaded client test completed successfully!\n\n");
+    return 0;
+}

@@ -38,6 +38,8 @@
 #include "shm/time_utils.h"
 #include "shm/precision_timer.h"  // 高精度 ARM64 计时器
 #include "hyper_amp_qos.h"  // QoS模块
+#include "shm/multithread_client.h"  // 多线程客户端
+#include "shm/multithread_service.h" // 多线程服务端
 
 // Global variables for signal handling
 static volatile int running = 1;
@@ -76,6 +78,10 @@ static void __attribute__((noreturn)) help(int exit_status) {
     printf("  HyperAMP service : ./hvisor shm hyper_amp_service shm_config.json\n");
     printf("HyperAMP client performance testing: ./hvisor shm hyper_amp_test shm_config.json \"hello\" 1\n");
     printf("HyperAMP service performance testing: ./hvisor shm hyper_amp_service_test shm_config.json\n");
+    printf("\n");
+    printf("Multi-threaded HyperAMP Commands:\n");
+    printf("  ./hvisor shm hyper_amp_test_mt <config> <data> <svc_id> <threads> [requests]\n");
+    printf("  ./hvisor shm hyper_amp_service_test_mt <config> [threads]\n");
     printf("\n");
     printf("QoS-Enabled HyperAMP Commands:\n");
     printf("  ./hvisor shm hyper_amp_qos <config> <data> <svc_id>  - QoS-aware client\n");
@@ -3382,6 +3388,14 @@ int main(int argc, char *argv[]) {
                 return -1;
             }
             hyper_amp_client_test(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "hyper_amp_test_mt") == 0) {
+            // 多线程客户端测试
+            hyper_amp_client_test_multithread(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "hyper_amp_service_test_mt") == 0) {
+            // 多线程服务端测试
+            hyper_amp_service_test_multithread(argc - 3, &argv[3]);
         }
         // ========== QoS命令 ==========
         else if(strcmp(argv[2], "hyper_amp_qos") == 0) {
