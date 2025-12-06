@@ -1036,6 +1036,15 @@ static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
         //     pr_err("The physical address to be mapped is not within the
         //     reserved memory\n"); return -EFAULT;
         // }
+        
+        // HyperAMP MMIO control region: 0x6e410000
+        // Use pgprot_noncached() for single-write MMIO (consistent with IVC)
+        unsigned long phys_addr = vma->vm_pgoff << PAGE_SHIFT;
+        if (phys_addr == 0x6e410000UL) {
+            vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+            pr_info("HyperAMP MMIO control region mapped at PA %#lx with non-cached protection\n", phys_addr);
+        }
+        
         err = remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff, size,
                               vma->vm_page_prot);
         if (err)
