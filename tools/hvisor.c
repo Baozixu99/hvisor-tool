@@ -38,6 +38,7 @@
 #include "shm/time_utils.h"
 #include "shm/precision_timer.h"  // 高精度 ARM64 计时器
 #include "hyper_amp_qos.h"  // QoS模块
+#include "hyperamp_client.h"  // HyperAMP 优化客户端
 
 // Global variables for signal handling
 static volatile int running = 1;
@@ -76,6 +77,7 @@ static void __attribute__((noreturn)) help(int exit_status) {
     printf("  HyperAMP service : ./hvisor shm hyper_amp_service shm_config.json\n");
     printf("HyperAMP client performance testing: ./hvisor shm hyper_amp_test shm_config.json \"hello\" 1\n");
     printf("HyperAMP service performance testing: ./hvisor shm hyper_amp_service_test shm_config.json\n");
+    printf("HyperAMP client performance testing: ./hvisor shm hyperamp_client shm_config.json \"hello\" 1\n");
     printf("\n");
     printf("QoS-Enabled HyperAMP Commands:\n");
     printf("  ./hvisor shm hyper_amp_qos <config> <data> <svc_id>  - QoS-aware client\n");
@@ -3252,7 +3254,6 @@ static int hyper_amp_client_test(int argc, char* argv[]) {
     return 0;
 }
 
-
 int main(int argc, char *argv[]) {
     int err = 0;
 
@@ -3382,6 +3383,17 @@ int main(int argc, char *argv[]) {
                 return -1;
             }
             hyper_amp_client_test(argc - 3, &argv[3]);
+        }
+        else if(strcmp(argv[2], "hyperamp_client") == 0) {
+            // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>
+            if (argc < 5) {
+                printf("Usage: ./hvisor shm hyperamp_client <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Examples:\n");
+                printf("  ./hvisor shm hyperamp_client shm_config.json \"hello world\" 1\n");
+                printf("  ./hvisor shm hyperamp_client shm_config.json @data.txt 2\n");
+                return -1;
+            }
+            hyperamp_client(argc - 3, &argv[3]);
         }
         // ========== QoS命令 ==========
         else if(strcmp(argv[2], "hyper_amp_qos") == 0) {

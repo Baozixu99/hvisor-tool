@@ -54,10 +54,19 @@ static channel_request(__u64 target_zone_id,
     args.service_id = service_id;
     args.swi = swi;
     printf("debug:args.target_zone_id = %ld,args.service_id = %ld,args.swi = %ld\n",args.target_zone_id,args.service_id,args.swi);
-
     int fd = open_hvisor_dev();
     clock_gettime(CLOCK_MONOTONIC, &start_time);
+    // 步骤2：ioctl 系统调用 (⚠️ 关键！)
+    uint64_t timer_freq = get_cntfrq();
+    uint64_t t_before_ioctl = get_cntpct();
+
     int ret = ioctl(fd, HVISOR_SHM_SIGNAL, &args);
+
+    uint64_t t_after_ioctl = get_cntpct();
+    printf("[Request] ioctl() ticks: start=%lu, end=%lu, diff=%lu\n",
+           t_before_ioctl, t_after_ioctl, t_after_ioctl - t_before_ioctl);
+    printf("[Request] ⚠️ ioctl(HVISOR_SHM_SIGNAL): %.3f us (ret=%d)\n", 
+           ticks_to_us(t_before_ioctl, t_after_ioctl, timer_freq) / 1.0, ret);
     if (ret < 0) {
         perror("end_exception_trace: ioctl failed");
     }
