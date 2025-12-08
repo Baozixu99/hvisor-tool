@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 
+#include "log.h"  // 日志系统
 #include "hyperamp_client.h"
 #include "shm/channel.h"
 #include "shm/msgqueue.h"
@@ -98,7 +99,7 @@ int hyperamp_client(int argc, char* argv[]) {
     for (int j = 0; j < data_size; j++) {
         shm_data[j] = data_buffer[j];
     }
-    shm_data[data_size] = '\0';
+    // shm_data[data_size] = '\0';
     __asm__ volatile("dmb sy" ::: "memory");
     uint64_t ticks_copy_end = get_cntpct();
     uint64_t copy_latency_ns = ticks_to_ns(ticks_copy_start, ticks_copy_end, timer_freq);
@@ -106,7 +107,7 @@ int hyperamp_client(int argc, char* argv[]) {
            data_size, copy_latency_ns, copy_latency_ns / 1000.0);
     // 设置消息
     msg->offset = client_ops.shm_addr_to_offset(shm_data);
-    msg->length = data_size + 1;
+    msg->length = data_size;
 
 
     
@@ -177,7 +178,7 @@ int hyperamp_client(int argc, char* argv[]) {
         printf("=== Service Result ===\n");
         
         // 获取处理后的实际数据大小
-        int result_data_size = msg->length > 0 ? msg->length - 1 : 0;
+        int result_data_size = msg->length > 0 ? msg->length : 0;
         if (result_data_size <= 0) {
             result_data_size = data_size;
         }
