@@ -18,7 +18,6 @@
 #include "shm/time_utils.h"
 #include "shm/precision_timer.h"
 #include "shm/hyperamp_ctrl.h"  // MMIO 控制区定义
-
 /* 通道初始化只能由一个任务(线程)完成 */
 // TODO: for multi-task, add lock
 // static volatile uint32_t channel_init_mark = INIT_MARK_RAW_STATE;
@@ -55,31 +54,36 @@ static int open_hvisor_dev() {
 static channel_request(__u64 target_zone_id,
     __u64 service_id, __u64 swi) {
     // ASSERT(swi == 0 || 1)
-    printf("channel_request: target_zone=%lu, service=%lu, swi=%lu\n", 
-           target_zone_id, service_id, swi);
+    // printf("channel_request: target_zone=%lu, service=%lu, swi=%lu\n", 
+    //        target_zone_id, service_id, swi);
     
     // ===== 性能优化：使用 MMIO 触发中断 =====
     if (hyperamp_ctrl != NULL) {
         // 使用 MMIO 方式（推荐，延迟 ~5-10μs）
         uint64_t timer_freq = get_cntfrq();
-        uint64_t t_before = get_cntpct();
         
         // 将参数打包成一个 32 位值：高 16 位为 zone_id，低 16 位为 service_id
         uint32_t packed_value = ((uint32_t)target_zone_id << 16) | ((uint32_t)service_id & 0xFFFF);
         
+        // 开始计时
+        uint64_t t_before = get_cntpct();
+        // printf("t_before_Counter: 0x%016lx (%lu)\n", t_before, t_before);
+
         // 写入 ipi_trigger 触发 MMIO trap，参数通过 mmio.value 传递给 hypervisor
         hyperamp_ctrl->ipi_trigger = packed_value;
         
-        // 确保写入生效（内存屏障）
+        // 确保写入完成（内存屏障必须在计时之前）
         __asm__ volatile("dmb sy" ::: "memory");
         
+        // 结束计时
         uint64_t t_after = get_cntpct();
-        printf("[Request] ✅ MMIO trigger: %.3f us (zone=%u, service=%u)\n",
-               ticks_to_us(t_before, t_after, timer_freq) / 1.0,
-               target_zone_id, service_id);
+        
+        double latency_us = ticks_to_us(t_before, t_after, timer_freq) / 1.0;
+        printf("[Request] MMIO trigger: %.3f us (zone=%u, service=%u, packed=0x%x)\n",
+               latency_us, target_zone_id, service_id, packed_value);
     } else {
         // 降级方案：使用 ioctl（兼容性，延迟 ~48.7ms）
-        printf("[Request] ⚠️ MMIO not available, fallback to ioctl\n");
+        printf("[Request] MMIO not available, fallback to ioctl\n");
         
         shm_args_t args;
         args.target_zone_id = target_zone_id;
@@ -96,7 +100,7 @@ static channel_request(__u64 target_zone_id,
         uint64_t t_after_ioctl = get_cntpct();
         printf("[Request] ioctl() ticks: start=%lu, end=%lu, diff=%lu\n",
                t_before_ioctl, t_after_ioctl, t_after_ioctl - t_before_ioctl);
-        printf("[Request] ⚠️ ioctl(HVISOR_SHM_SIGNAL): %.3f us (ret=%d)\n", 
+        printf("[Request] ioctl(HVISOR_SHM_SIGNAL): %.3f us (ret=%d)\n",
                ticks_to_us(t_before_ioctl, t_after_ioctl, timer_freq) / 1.0, ret);
         
         close(fd);
@@ -150,10 +154,12 @@ int32_t channels_init(void)
         printf("channels_init_info: ✅ MMIO control region mapped at %p (PA=0x%lx, size=%d)\n",
                hyperamp_ctrl, HYPERAMP_CTRL_PA, HYPERAMP_CTRL_SIZE);
         
-        // ⚠️ 不要在初始化时写入 MMIO 控制区!
-        // MMIO 区域已设置为 pgprot_device(),任何写入都会触发 Page Fault 陷入 Hypervisor
-        // 只在 channel_request() 真正发送请求时写入
-        printf("channels_init_info: MMIO control region ready, will trigger on first request\n");
+        // 预热访问：使用写入操作触发 Stage-1 Page Fault，让内核建立写权限的页表
+        // 注意：必须用写入！读写的页表权限可能分开建立
+        printf("channels_init_info: Warming up MMIO region (write-access)...\n");
+        hyperamp_ctrl->ipi_trigger = 0;  // 写入 0 触发 Page Fault + MMIO trap
+        __asm__ volatile("dmb sy" ::: "memory");  // 确保写入完成
+        printf("channels_init_info: ✅ MMIO page table pre-populated (warmup done)\n");
     }
 
     // open hvisor driver
@@ -470,7 +476,7 @@ static int32_t channel_msg_send(struct Channel* channel,struct Msg* msg)
 
 static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* msg)
 {
-    printf("channel_msg_send_and_notify\n");
+    // printf("channel_msg_send_and_notify\n");
 
     struct MsgEntry* entry = (struct MsgEntry*)msg;
     int ret = -1;
@@ -480,7 +486,7 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
     ret = msg_queue_ops.push(channel->msg_queue, &channel->msg_queue->wait_h,
                              entry->cur_idx);
 
-    printf("msg_send_and_notify: msg_queue_ops.push ret = %d\n", ret);
+    // printf("msg_send_and_notify: msg_queue_ops.push ret = %d\n", ret);
     if (ret == 0) {
         channel->msg_queue_mutex->msg_wait_cnt++;
     } else {
@@ -489,12 +495,12 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
         while(1) {}
     }
 
-    printf("msg_send_and_notify: msg_wait_cnt = %u\n", channel->msg_queue_mutex->msg_wait_cnt);
+    // printf("msg_send_and_notify: msg_wait_cnt = %u\n", channel->msg_queue_mutex->msg_wait_cnt);
 
     if (channel->msg_queue_mutex->msg_wait_cnt == 0) /* 没有需要处理的消息 */
 	{
 		byte_flag_ops.unlock(&channel->msg_queue_mutex->wait_lock);
-		printf("msg_send_and_notify: have no wait msg\n");
+		// printf("msg_send_and_notify: have no wait msg\n");
 		return 0;
 	}
 
@@ -503,8 +509,8 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
 	while (channel->msg_queue->working_mark != MSG_QUEUE_MARK_IDLE) 
     /* 等待远程Zone处理完上一批消息 */
 	{ 
-        printf("wait for msg_queue_mark == MSG_QUEUE_MARK_IDLE, %lx\n", channel->msg_queue->working_mark);
-        sleep(5);
+        // printf("wait for msg_queue_mark == MSG_QUEUE_MARK_IDLE, %lx\n", channel->msg_queue->working_mark);
+        // sleep(5);
     }
 
     // printf("msg_send_and_notify: remote idel, prepare to notify, msg_queue_mark = %x\n", 
@@ -514,7 +520,7 @@ static int32_t channel_msg_send_and_notify(struct Channel* channel, struct Msg* 
 	if (msg_queue_ops.transfer(channel->msg_queue, &channel->msg_queue->wait_h, &channel->msg_queue->proc_ing_h) != 0)
 	{
 		byte_flag_ops.unlock(&channel->msg_queue_mutex->wait_lock);
-		printf("msg_send_and_notify: add wait msg to process queue\n");
+		// printf("msg_send_and_notify: add wait msg to process queue\n");
 		// return -1;
         while(1) {}
 	}

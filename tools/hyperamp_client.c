@@ -20,8 +20,12 @@
 #include "shm/msg.h"
 #include "service/safe_service.h"
 
-
 int hyperamp_client(int argc, char* argv[]) {
+        
+    // 获取计数器频率
+    uint64_t timer_freq = get_cntfrq();
+    uint64_t ticks_start = get_cntpct();
+
     // 参数检查
     if (argc < 3) {
         printf("Usage: ./hvisor shm hyperamp_client <shm_json_path> <data|@filename> <service_id>\n");
@@ -84,14 +88,7 @@ int hyperamp_client(int argc, char* argv[]) {
         free(data_buffer);
         return -1;
     }
-    
-    // 获取计数器频率
-    uint64_t timer_freq = get_cntfrq();
-    // ============================================================
-    // 性能测试：在发送消息前才开始计时，只测量通信时延
-    // ============================================================
-    uint64_t ticks_start = get_cntpct();
-    printf("[Linux] Sending message, Counter: 0x%016lx (%lu)\n", ticks_start, ticks_start);
+
 
     // 复制数据到共享内存
     // memcpy(shm_data, data_buffer, data_size);
@@ -114,10 +111,10 @@ int hyperamp_client(int argc, char* argv[]) {
 
     
 
-        
+    
     // 发送消息并通知
     uint64_t ticks_send_start = get_cntpct();
-    printf("[Linux] irq send start: 0x%016lx (%lu)\n", ticks_send_start, ticks_send_start);
+    // printf("[Linux] irq send start: 0x%016lx (%lu)\n", ticks_send_start, ticks_send_start);
     
     if (client_ops.msg_send_and_notify(&amp_client, msg) != 0) {
         printf("error : msg send failed [offset = 0x%x, length = %u]\n", msg->offset, msg->length);
@@ -127,7 +124,7 @@ int hyperamp_client(int argc, char* argv[]) {
 
     // 记录发送完成的时间点
     uint64_t ticks_send_done = get_cntpct();
-    printf("[Linux] irq send end: 0x%016lx (%lu)\n", ticks_send_done, ticks_send_done);
+    // printf("[Linux] irq send end: 0x%016lx (%lu)\n", ticks_send_done, ticks_send_done);
     uint64_t irq_copy_latency_ns = ticks_to_ns(ticks_send_start, ticks_send_done, timer_freq);
 
     printf("[Performance] irq: %lu ns (%.3f us)\n",  irq_copy_latency_ns, irq_copy_latency_ns / 1000.0);

@@ -234,7 +234,7 @@ static int32_t client_msg_send(struct Client* client, struct Msg* full_msg)
 
 static int32_t client_msg_send_and_notify(struct Client* client, struct Msg* full_msg)
 { 
-  printf("client msg send and notify enter\n");
+  // printf("client msg send and notify enter\n");
   ASSERT(client != NULL);
   ASSERT(full_msg != NULL);
 
