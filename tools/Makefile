@@ -51,7 +51,7 @@ endif
 
 .PHONY: all clean
 
-all: hvisor ivc_demo rpmsg_demo
+all: hvisor ivc_demo rpmsg_demo hyperamp_linux
 
 %.d: %.c
 	@set -e; rm -f $@; \
@@ -71,5 +71,8 @@ ivc_demo: $(ivc_demo_object)
 rpmsg_demo: $(rpmsg_demo_object)
 	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LIBS)
 
+hyperamp_linux: shm/hyperamp_linux_shm.c
+	$(CC) -o $@ $< $(CFLAGS) $(include_dirs) $(LIBS) -DHYPERAMP_TEST_MAIN
+
 clean:
-	rm -f hvisor ivc_demo rpmsg_demo *.o *.d *.d.* virtio_gpu/*.o virtio_gpu/*.d virtio_gpu/*.d.* shm/*.o shm/*.d shm/*.d.*
+	rm -f hvisor ivc_demo rpmsg_demo hyperamp_linux *.o *.d *.d.* virtio_gpu/*.o virtio_gpu/*.d virtio_gpu/*.d.* shm/*.o shm/*.d shm/*.d.*
