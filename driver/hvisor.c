@@ -1037,12 +1037,22 @@ static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
         //     reserved memory\n"); return -EFAULT;
         // }
         
-        // HyperAMP MMIO control region: 0x6e410000
-        // Use pgprot_noncached() for single-write MMIO (consistent with IVC)
+        // HyperAMP shared memory regions: use uncached mapping
+        // TX Queue: 0xDE000000, RX Queue: 0xDE001000, Data Region: 0xDE002000
         unsigned long phys_addr = vma->vm_pgoff << PAGE_SHIFT;
-        if (phys_addr == 0x6e410000UL) {
+        
+        // HyperAMP shared memory region (0xDE000000 - 0xDE402000, ~4MB)
+        if (phys_addr >= 0xDE000000UL && phys_addr < 0xDE500000UL) {
             vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-            pr_info("HyperAMP MMIO control region mapped at PA %#lx with non-cached protection\n", phys_addr);
+            pr_info("HyperAMP shared memory mapped at PA %#lx with uncached protection (size: %#lx)\n", 
+                    phys_addr, size);
+            pr_info("  vm_page_prot pgprot value: %#lx (should have non-cacheable bits set)\n",
+                    pgprot_val(vma->vm_page_prot));
+        }
+        // HyperAMP MMIO control region: 0x6e410000
+        else if (phys_addr == 0x6e410000UL) {
+            vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+            pr_info("HyperAMP MMIO control region mapped at PA %#lx with uncached protection\n", phys_addr);
         }
         
         err = remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff, size,

@@ -24,6 +24,35 @@
 
 #include "shm/hyperamp_shm_queue.h"
 
+/* ==================== 平台检测和 Cache 操作宏 ==================== */
+
+#if defined(__aarch64__) || defined(__arm64__)
+    /* ARM64 平台：使用内存屏障代替硬件缓存指令（用户空间无法执行特权指令） */
+    #define CACHE_INVALIDATE(addr) do { \
+        __asm__ volatile("dmb sy" ::: "memory"); \
+    } while(0)
+    
+    #define CACHE_FLUSH(addr) do { \
+        __asm__ volatile("dmb sy" ::: "memory"); \
+    } while(0)
+    
+#elif defined(__x86_64__) || defined(__i386__)
+    /* x86/x86_64 平台：使用内存屏障（Cache 由硬件自动维护一致性） */
+    #define CACHE_INVALIDATE(addr) do { \
+        __asm__ volatile("mfence" ::: "memory"); \
+    } while(0)
+    
+    #define CACHE_FLUSH(addr) do { \
+        __asm__ volatile("mfence" ::: "memory"); \
+    } while(0)
+    
+#else
+    /* 其他平台：使用编译器内存屏障 */
+    #define CACHE_INVALIDATE(addr) __sync_synchronize()
+    #define CACHE_FLUSH(addr) __sync_synchronize()
+    #warning "Unknown architecture, using compiler memory barrier"
+#endif
+
 /* ==================== 配置定义 ==================== */
 
 /* 共享内存物理地址 - 新版 HyperAMP 布局 (双向通信) */
@@ -74,25 +103,25 @@ static HyperampLinuxContext g_ctx = {0};
  */
 static int map_physical_memory(uint64_t phys_addr, size_t size)
 {
-    // 打开 /dev/mem
-    g_ctx.fd_mem = open("/dev/mem", O_RDWR | O_SYNC);
+    // 使用 /dev/hvisor 代替 /dev/mem 以获得 uncached 映射
+    g_ctx.fd_mem = open("/dev/hvisor", O_RDWR | O_SYNC);
     if (g_ctx.fd_mem < 0) {
-        perror("[HyperAMP] Failed to open /dev/mem");
+        perror("[HyperAMP] Failed to open /dev/hvisor");
         return HYPERAMP_ERROR;
     }
     
     // 计算页对齐
     size_t page_size = sysconf(_SC_PAGESIZE);
     off_t page_offset = phys_addr & (page_size - 1);
-    off_t page_aligned_addr = phys_addr & ~(page_size - 1);
     size_t map_size = size + page_offset;
     
-    // 映射内存 (使用 MAP_SHARED，不缓存)
+    // 映射内存：通过 /dev/hvisor 的 mmap，驱动会自动应用 uncached 属性
+    // 注意：mmap 的 offset 参数直接传递物理地址，内核会自动转换为页号
     void *mapped = mmap(NULL, map_size, 
                         PROT_READ | PROT_WRITE, 
                         MAP_SHARED, 
                         g_ctx.fd_mem, 
-                        page_aligned_addr);
+                        phys_addr);  // 直接传递原始物理地址，不要预先对齐
     
     if (mapped == MAP_FAILED) {
         perror("[HyperAMP] mmap failed");
@@ -105,7 +134,7 @@ static int map_physical_memory(uint64_t phys_addr, size_t size)
     g_ctx.shm_size = size;
     g_ctx.phys_addr = phys_addr;
     
-    printf("[HyperAMP] Physical memory mapped:\n");
+    printf("[HyperAMP] Physical memory mapped via /dev/hvisor (uncached):\n");
     printf("[HyperAMP]   Physical addr: 0x%lx\n", phys_addr);
     printf("[HyperAMP]   Virtual addr:  %p\n", g_ctx.shm_base);
     printf("[HyperAMP]   Size:          %zu bytes\n", size);
@@ -165,19 +194,22 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         return HYPERAMP_ERROR;
     }
     
-    // 新版 HyperAMP 内存布局 (管理信息在共享内存头部):
-    // 0xde000000: TX Queue (64KB) - Linux 写, seL4 读
-    // 0xde010000: RX Queue (64KB) - seL4 写, Linux 读
-    // 0xde020000: Data Region (4MB) - 共享数据
-    g_ctx.tx_queue = (volatile HyperampShmQueue *)g_ctx.shm_base;
-    g_ctx.rx_queue = (volatile HyperampShmQueue *)((char *)g_ctx.shm_base + SHM_QUEUE_SIZE);
+    // HyperAMP 4KB 队列布局 (与 seL4 端匹配):
+    // 0xDE000000: TX Queue (4KB) - seL4 写, Linux 读 (seL4 发送请求给 Linux)
+    // 0xDE001000: RX Queue (4KB) - Linux 写, seL4 读 (Linux 发送响应给 seL4)
+    // 0xDE002000: Data Region (4MB) - 共享数据区
+    // 
+    // 注意: Linux 的 RX Queue = seL4 的 TX Queue (物理地址 0xDE000000)
+    //       Linux 的 TX Queue = seL4 的 RX Queue (物理地址 0xDE001000)
+    g_ctx.tx_queue = (volatile HyperampShmQueue *)((char *)g_ctx.shm_base + SHM_QUEUE_SIZE);  // 0xDE001000
+    g_ctx.rx_queue = (volatile HyperampShmQueue *)g_ctx.shm_base;                              // 0xDE000000
     g_ctx.data_region = (volatile void *)((char *)g_ctx.shm_base + 2 * SHM_QUEUE_SIZE);
     
     printf("[HyperAMP] Memory layout:\n");
     printf("[HyperAMP]   TX Queue:    %p (phys: 0x%lx)\n", 
-           g_ctx.tx_queue, phys_addr);
+           g_ctx.tx_queue, phys_addr + SHM_QUEUE_SIZE);
     printf("[HyperAMP]   RX Queue:    %p (phys: 0x%lx)\n", 
-           g_ctx.rx_queue, phys_addr + SHM_QUEUE_SIZE);
+           g_ctx.rx_queue, phys_addr);
     printf("[HyperAMP]   Data Region: %p (phys: 0x%lx, size: %d bytes)\n", 
            g_ctx.data_region, phys_addr + 2 * SHM_QUEUE_SIZE, SHM_DATA_SIZE);
     
@@ -223,10 +255,8 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         printf("[HyperAMP] Connecting to existing queues (no wait mode)...\n");
         
         /* 重要：清理 CPU 数据缓存，确保读取到 seL4 写入的最新数据 */
-        __asm__ volatile("dc civac, %0" : : "r"(g_ctx.tx_queue) : "memory");
-        __asm__ volatile("dc civac, %0" : : "r"(g_ctx.rx_queue) : "memory");
-        __asm__ volatile("dsb sy" ::: "memory");
-        __asm__ volatile("isb" ::: "memory");
+        CACHE_INVALIDATE(g_ctx.tx_queue);
+        CACHE_INVALIDATE(g_ctx.rx_queue);
         
         // 打印原始数据以调试
         printf("[HyperAMP] DEBUG: Raw TX Queue bytes (first 32):\n[HyperAMP]   ");
@@ -251,15 +281,30 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         
         printf("[HyperAMP] TX capacity=%u (expected 256), RX capacity=%u (expected 256)\n", tx_cap, rx_cap);
         
-        if (tx_cap == 0 && rx_cap == 0) {
-            printf("[HyperAMP] WARNING: Both queues appear uninitialized!\n");
-            printf("[HyperAMP] This means seL4's writes are NOT visible to Linux.\n");
-            printf("[HyperAMP] Check Hvisor shared memory configuration!\n");
-            unmap_physical_memory();
-            return HYPERAMP_ERROR;
+        // 调试：打印队列头部的原始字节
+        printf("[HyperAMP] DEBUG: TX Queue raw bytes at offset 0-15:\n");
+        printf("[HyperAMP]   ");
+        for (int i = 0; i < 16; i++) {
+            printf("%02x ", ((volatile uint8_t *)g_ctx.tx_queue)[i]);
         }
+        printf("\n");
         
-        printf("[HyperAMP] Found at least one initialized queue, proceeding...\n");
+        printf("[HyperAMP] DEBUG: RX Queue raw bytes at offset 0-15:\n");
+        printf("[HyperAMP]   ");
+        for (int i = 0; i < 16; i++) {
+            printf("%02x ", ((volatile uint8_t *)g_ctx.rx_queue)[i]);
+        }
+        printf("\n");
+        
+        if (tx_cap == 0 && rx_cap == 0) {
+            printf("[HyperAMP] INFO: Queues not yet initialized by seL4\n");
+            printf("[HyperAMP] Will wait for seL4 to initialize them...\n");
+            // 不返回错误，让后端模拟器继续轮询
+        } else if (tx_cap == 256 && rx_cap == 256) {
+            printf("[HyperAMP] ✓ Found initialized queue(s), ready for communication\n");
+        } else {
+            printf("[HyperAMP] WARNING: Unexpected capacity values (may indicate wrong address or corrupted memory)\n");
+        }
     }
     
     g_ctx.initialized = 1;
@@ -325,9 +370,39 @@ int hyperamp_linux_send(uint8_t msg_type,
                         const void *payload, 
                         uint16_t payload_len)
 {
+    static int queue_not_ready_printed = 0;  // 只打印一次"队列未就绪"
+    static int queue_ready_printed = 0;      // 只打印一次"队列已就绪"
+    
     if (!g_ctx.initialized) {
         printf("[HyperAMP] Not initialized\n");
         return HYPERAMP_ERROR;
+    }
+    
+    /* 关键：发送前失效 TX Queue 缓存，确保读取到最新的队列状态 */
+    CACHE_INVALIDATE(g_ctx.tx_queue);
+    
+    // 检查队列是否已被 seL4 初始化（避免访问未初始化队列导致段错误）
+    uint16_t tx_capacity = hyperamp_safe_read_u16(g_ctx.tx_queue, offsetof(HyperampShmQueue, capacity));
+    
+    if (tx_capacity == 0) {
+        // TX 队列未初始化，说明 seL4 还未启动，不发送消息
+        if (!queue_not_ready_printed) {
+            printf("[HyperAMP] TX Queue not initialized yet (capacity=0), waiting for seL4...\n");
+            queue_not_ready_printed = 1;
+        }
+        return HYPERAMP_ERROR;
+    }
+    
+    // 队列已就绪，打印一次
+    if (!queue_ready_printed) {
+        // 关键：检测到队列就绪后，再次强制失效 cache，确保读取最新的队列数据
+        CACHE_INVALIDATE(g_ctx.tx_queue);
+        
+        // 重新读取 capacity，确保是正确的值
+        tx_capacity = hyperamp_safe_read_u16(g_ctx.tx_queue, offsetof(HyperampShmQueue, capacity));
+        
+        printf("[HyperAMP] ✓ TX Queue initialized (capacity=%u), ready to send!\n", tx_capacity);
+        queue_ready_printed = 1;
     }
     
     if (payload_len > HYPERAMP_MSG_MAX_SIZE) {
@@ -338,27 +413,30 @@ int hyperamp_linux_send(uint8_t msg_type,
     // 准备消息缓冲区
     uint8_t msg_buf[HYPERAMP_MSG_HDR_PLUS_MAX_SIZE];
     HyperampMsgHeader *hdr = (HyperampMsgHeader *)msg_buf;
-    
     hdr->version = 1;
     hdr->proxy_msg_type = msg_type;
     hdr->frontend_sess_id = frontend_sess_id;
     hdr->backend_sess_id = backend_sess_id;
     hdr->payload_len = payload_len;
     
-    // 复制载荷
+    // 复制载荷（使用逐字节复制，避免 memcpy 的 SIMD 优化在非缓存内存触发总线错误）
     if (payload && payload_len > 0) {
-        memcpy(msg_buf + sizeof(HyperampMsgHeader), payload, payload_len);
+        uint8_t *dst = msg_buf + sizeof(HyperampMsgHeader);
+        const uint8_t *src = (const uint8_t *)payload;
+        for (uint16_t i = 0; i < payload_len; i++) {
+            dst[i] = src[i];
+        }
     }
     
     size_t total_len = sizeof(HyperampMsgHeader) + payload_len;
     
     // 入队
-    // 注意：数据区基址要跳过队列控制块
-    volatile void *tx_data_base = (volatile void *)((char *)g_ctx.tx_queue + sizeof(HyperampShmQueue));
+    // 重要：数据区使用独立的共享内存区域，而不是队列控制块后面
+    // TX Queue 和 RX Queue 只存储队列元数据，实际数据存储在 data_region
+    volatile void *tx_data_base = g_ctx.data_region;
     
     int ret = hyperamp_queue_enqueue(g_ctx.tx_queue, ZONE_ID_LINUX, 
                                       msg_buf, total_len, tx_data_base);
-    
     if (ret == HYPERAMP_OK) {
         g_ctx.tx_count++;
         printf("[HyperAMP] TX: type=%u, sess=%u/%u, len=%u (total: %u)\n",
@@ -384,39 +462,91 @@ int hyperamp_linux_recv(HyperampMsgHeader *hdr,
                         uint16_t max_payload_len,
                         uint16_t *actual_payload_len)
 {
+    static int queue_not_ready_printed = 0;  // 只打印一次"队列未就绪"
+    static int queue_ready_printed = 0;      // 只打印一次"队列已就绪"
+    
     if (!g_ctx.initialized || !hdr) {
         return HYPERAMP_ERROR;
     }
     
+    /* 关键：每次接收前都要失效 cache，确保读取到 seL4 的最新数据！ */
+    CACHE_INVALIDATE(g_ctx.rx_queue);
+    
+    // 检查队列是否已被 seL4 初始化（避免访问未初始化队列导致段错误）
+    uint16_t rx_capacity = hyperamp_safe_read_u16(g_ctx.rx_queue, offsetof(HyperampShmQueue, capacity));
+    
+    if (rx_capacity == 0) {
+        // 队列未初始化，直接返回（只打印一次）
+        if (!queue_not_ready_printed) {
+            printf("[HyperAMP] RX Queue not initialized yet (capacity=0), waiting for seL4...\n");
+            queue_not_ready_printed = 1;
+        }
+        return HYPERAMP_ERROR;
+    }
+    
+    // 队列已就绪，打印一次
+    if (!queue_ready_printed) {
+        // 关键：检测到队列就绪后，再次强制失效 cache，确保读取最新的队列数据
+        CACHE_INVALIDATE(g_ctx.rx_queue);
+        
+        // 重新读取 capacity，确保是正确的值
+        rx_capacity = hyperamp_safe_read_u16(g_ctx.rx_queue, offsetof(HyperampShmQueue, capacity));
+        
+        printf("[HyperAMP] ✓ RX Queue initialized (capacity=%u), ready to receive!\n", rx_capacity);
+        
+        // 关键：打印前再次失效缓存，确保读取的是最新数据而不是 CPU 缓存中的旧数据
+        CACHE_INVALIDATE(g_ctx.rx_queue);
+        // 打印队列头部的原始字节（只在首次初始化时）
+        volatile uint8_t *rx_bytes = (volatile uint8_t *)g_ctx.rx_queue;
+        for (int i = 0; i < 16; i++) {
+            printf("%02x ", rx_bytes[i]);
+        }
+        printf("\n");
+        
+        queue_ready_printed = 1;
+    }
+    
     uint8_t msg_buf[HYPERAMP_MSG_HDR_PLUS_MAX_SIZE];
     size_t actual_len = 0;
-    
-    volatile void *rx_data_base = (volatile void *)((char *)g_ctx.rx_queue + sizeof(HyperampShmQueue));
-    
+    // 重要：数据区使用独立的共享内存区域，而不是队列控制块后面
+
+    volatile void *rx_data_base = g_ctx.data_region;
+
+    // rx_queue出队，Physical addr: 0xde000000
     int ret = hyperamp_queue_dequeue(g_ctx.rx_queue, ZONE_ID_LINUX,
                                       msg_buf, sizeof(msg_buf), &actual_len, rx_data_base);
-    
     if (ret != HYPERAMP_OK) {
         return HYPERAMP_ERROR;  // 队列空
     }
-    
+
     if (actual_len < sizeof(HyperampMsgHeader)) {
         g_ctx.rx_errors++;
         printf("[HyperAMP] RX: invalid message (too short: %zu)\n", actual_len);
         return HYPERAMP_ERROR;
     }
-    
-    // 解析消息头
-    memcpy(hdr, msg_buf, sizeof(HyperampMsgHeader));
-    
-    // 复制载荷
+
+    // 解析消息头，生命周期被限制在花括号内部，避免和下面的dst、src变量冲突
+    {
+        uint8_t *dst = (uint8_t *)hdr;
+        const uint8_t *src = msg_buf;
+        for (size_t i = 0; i < sizeof(HyperampMsgHeader); i++) {
+            dst[i] = src[i];
+        }
+    }
+   
+    // 复制载荷长度
     uint16_t payload_len = hdr->payload_len;
     if (payload_len > max_payload_len) {
         payload_len = max_payload_len;
     }
     
+    // 复制载荷
     if (payload && payload_len > 0) {
-        memcpy(payload, msg_buf + sizeof(HyperampMsgHeader), payload_len);
+        uint8_t *dst = (uint8_t *)payload;
+        const uint8_t *src = msg_buf + sizeof(HyperampMsgHeader);
+        for (uint16_t i = 0; i < payload_len; i++) {
+            dst[i] = src[i];
+        }
     }
     
     if (actual_payload_len) {

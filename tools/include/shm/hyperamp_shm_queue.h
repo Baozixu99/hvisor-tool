@@ -61,38 +61,43 @@ typedef struct {
     
     /* 数据缓存清理 - 将缓存行刷新到主存 (用于共享内存写入) */
     static inline void hyperamp_cache_clean(volatile void *addr, size_t size) {
-        volatile char *p = (volatile char *)addr;
-        volatile char *end = p + size;
-        /* ARM64 缓存行通常是 64 字节 */
-        for (; p < end; p += 64) {
-            __asm__ volatile("dc cvac, %0" : : "r"(p) : "memory");
-        }
-        __asm__ volatile("dsb sy" ::: "memory");
+        // volatile char *p = (volatile char *)addr;
+        // volatile char *end = p + size;
+        // /* ARM64 缓存行通常是 64 字节 */
+        // for (; p < end; p += 64) {
+        //     __asm__ volatile("dc cvac, %0" : : "r"(p) : "memory");
+        // }
+        // __asm__ volatile("dsb sy" ::: "memory");
+        
+        (void)addr; (void)size;
+        __asm__ volatile("dmb sy" ::: "memory");
     }
     
     /* 数据缓存失效 - 丢弃缓存内容，强制从内存读取 (用于共享内存读取) */
     static inline void hyperamp_cache_invalidate(volatile void *addr, size_t size) {
-        volatile char *p = (volatile char *)addr;
-        volatile char *end = p + size;
-        for (; p < end; p += 64) {
-            __asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
-        }
-        __asm__ volatile("dsb sy" ::: "memory");
+        // volatile char *p = (volatile char *)addr;
+        // volatile char *end = p + size;
+        // for (; p < end; p += 64) {
+        //     __asm__ volatile("dc ivac, %0" : : "r"(p) : "memory");
+        // }
+        // __asm__ volatile("dsb sy" ::: "memory");
+        (void)addr; (void)size;
+        __asm__ volatile("dmb sy" ::: "memory");
     }
 #else
-    #define HYPERAMP_DMB()   __asm__ volatile("mfence" ::: "memory")
-    #define HYPERAMP_DSB()   __asm__ volatile("mfence" ::: "memory")
-    #define HYPERAMP_ISB()   __asm__ volatile("" ::: "memory")
+    // #define HYPERAMP_DMB()   __asm__ volatile("mfence" ::: "memory")
+    // #define HYPERAMP_DSB()   __asm__ volatile("mfence" ::: "memory")
+    // #define HYPERAMP_ISB()   __asm__ volatile("" ::: "memory")
     
-    static inline void hyperamp_cache_clean(volatile void *addr, size_t size) {
-        (void)addr; (void)size;
-        __asm__ volatile("mfence" ::: "memory");
-    }
+    // static inline void hyperamp_cache_clean(volatile void *addr, size_t size) {
+    //     (void)addr; (void)size;
+    //     __asm__ volatile("mfence" ::: "memory");
+    // }
     
-    static inline void hyperamp_cache_invalidate(volatile void *addr, size_t size) {
-        (void)addr; (void)size;
-        __asm__ volatile("mfence" ::: "memory");
-    }
+    // static inline void hyperamp_cache_invalidate(volatile void *addr, size_t size) {
+    //     (void)addr; (void)size;
+    //     __asm__ volatile("mfence" ::: "memory");
+    // }
 #endif
 
 #define HYPERAMP_BARRIER()   do { HYPERAMP_DMB(); HYPERAMP_DSB(); } while(0)
@@ -109,6 +114,9 @@ static inline void hyperamp_spinlock_init(volatile HyperampSpinlock *lock)
         p[i] = 0;
     }
     HYPERAMP_BARRIER();
+    
+    /* 刷新锁状态到主存 */
+    hyperamp_cache_clean((volatile void *)lock, sizeof(HyperampSpinlock));
 }
 
 /**
@@ -139,6 +147,9 @@ static inline void hyperamp_spinlock_lock(volatile HyperampSpinlock *lock, uint3
                 lock->owner_zone_id = zone_id;
                 lock->lock_count++;
                 HYPERAMP_BARRIER();
+                
+                /* 刷新锁状态到主存，确保其他核心/虚拟机能看到锁已被占用 */
+                hyperamp_cache_clean((volatile void *)lock, sizeof(HyperampSpinlock));
                 return;  // 成功获取锁
             }
         }
@@ -175,6 +186,9 @@ static inline void hyperamp_spinlock_unlock(volatile HyperampSpinlock *lock)
     lock->owner_zone_id = 0;
     lock->lock_value = 0;
     HYPERAMP_BARRIER();
+    
+    /* 关键：刷新锁状态到主存，确保其他核心/虚拟机能看到锁已释放 */
+    hyperamp_cache_clean((volatile void *)lock, sizeof(HyperampSpinlock));
 }
 
 /**
@@ -524,11 +538,19 @@ static inline int hyperamp_queue_init(volatile HyperampShmQueue *queue,
             p[magic_offset + 12 + i] = 0;
         }
         HYPERAMP_BARRIER();
+        
+        /* 关键：刷新整个队列控制块的缓存到主存，确保其他核心/虚拟机能看到最新数据 */
+        printf("[HyperAmp] Flushing cache to memory...\n");
+        hyperamp_cache_clean((volatile void *)queue, sizeof(HyperampShmQueue));
+        
         printf("[HyperAmp] Queue initialization complete!\n");
     } else {
         // 非创建者：只设置自己的虚拟地址
         queue->virt_addr2 = config->virt_addr;
         HYPERAMP_BARRIER();
+        
+        /* 刷新修改后的虚拟地址字段到主存 */
+        hyperamp_cache_clean((volatile void *)&queue->virt_addr2, 8);
     }
     
     return HYPERAMP_OK;
@@ -639,13 +661,13 @@ static inline int hyperamp_queue_dequeue(volatile HyperampShmQueue *queue,
     
     // 获取锁
     hyperamp_spinlock_lock(&queue->queue_lock, zone_id);
-    
+    // printf("[HyperAmp] Dequeue: header=%d, tail=%d\n", queue->header, queue->tail);
+    // fflush(stdout);
     // 检查队列是否为空
     if (queue->tail == queue->header) {
         hyperamp_spinlock_unlock(&queue->queue_lock);
         return HYPERAMP_ERROR;  // 队列空
     }
-    
     // 计算读取地址：tail + 1 的位置
     uint64_t read_addr = (uint64_t)virt_base + (uint64_t)(queue->tail + 1) * queue->block_size;
     
@@ -674,7 +696,6 @@ static inline int hyperamp_queue_dequeue(volatile HyperampShmQueue *queue,
     
     // 释放锁
     hyperamp_spinlock_unlock(&queue->queue_lock);
-    
     return HYPERAMP_OK;
 }
 
