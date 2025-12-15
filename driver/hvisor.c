@@ -1038,11 +1038,11 @@ static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
         // }
         
         // HyperAMP shared memory regions: use uncached mapping
-        // TX Queue: 0xDE000000, RX Queue: 0xDE001000, Data Region: 0xDE002000
+        // TX Queue: 0x7E000000, RX Queue: 0x7E001000, Data Region: 0x7E002000
         unsigned long phys_addr = vma->vm_pgoff << PAGE_SHIFT;
-        
-        // HyperAMP shared memory region (0xDE000000 - 0xDE402000, ~4MB)
-        if (phys_addr >= 0xDE000000UL && phys_addr < 0xDE500000UL) {
+
+        // HyperAMP shared memory region (0x7E000000 - 0x7E402000, ~4MB)
+        if (phys_addr >= 0x7E000000UL && phys_addr < 0x7E500000UL) {
             vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
             pr_info("HyperAMP shared memory mapped at PA %#lx with uncached protection (size: %#lx)\n", 
                     phys_addr, size);
