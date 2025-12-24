@@ -56,10 +56,7 @@
 /* ==================== 配置定义 ==================== */
 
 /* 共享内存物理地址 - 新版 HyperAMP 布局 (双向通信) */
-#define SHM_TX_QUEUE_PADDR          0xDE000000UL  // Linux → seL4 队列
-#define SHM_RX_QUEUE_PADDR          0xDE001000UL  // seL4 → Linux 队列 (偏移 4KB)
-#define SHM_DATA_PADDR              0xDE002000UL  // 共享数据区 (偏移 8KB)
-
+#define SHM_START_PADDR              0xDE000000UL   // 共享内存起始物理地址
 #define SHM_QUEUE_SIZE              (4 * 1024)    // 4KB 队列控制区 (实际 ~4068 bytes)
 #define SHM_DATA_SIZE               (4 * 1024 * 1024)  // 4MB 数据区
 
@@ -180,7 +177,7 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
     
     // 使用默认地址 (TX Queue 起始地址)
     if (phys_addr == 0) {
-        phys_addr = SHM_TX_QUEUE_PADDR;
+        phys_addr = SHM_START_PADDR;
     }
     
     printf("[HyperAMP] ========================================\n");
@@ -195,14 +192,14 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
     }
     
     // HyperAMP 4KB 队列布局 (与 seL4 端匹配):
-    // 0xDE000000: TX Queue (4KB) - seL4 写, Linux 读 (seL4 发送请求给 Linux)
-    // 0xDE001000: RX Queue (4KB) - Linux 写, seL4 读 (Linux 发送响应给 seL4)
+    // 0xDE000000: RX Queue (4KB) - seL4 写, Linux 读 (seL4 发送请求给 Linux)
+    // 0xDE001000: TX Queue (4KB) - Linux 写, seL4 读 (Linux 发送响应给 seL4)
     // 0xDE002000: Data Region (4MB) - 共享数据区
     // 
-    // 注意: Linux 的 RX Queue = seL4 的 TX Queue (物理地址 0xDE000000)
-    //       Linux 的 TX Queue = seL4 的 RX Queue (物理地址 0xDE001000)
+    // Linux 的 RX Queue = seL4 的 TX Queue (物理地址 0xDE000000)
+    // Linux 的 TX Queue = seL4 的 RX Queue (物理地址 0xDE001000)
     g_ctx.tx_queue = (volatile HyperampShmQueue *)((char *)g_ctx.shm_base + SHM_QUEUE_SIZE);  // 0xDE001000
-    g_ctx.rx_queue = (volatile HyperampShmQueue *)g_ctx.shm_base;                              // 0xDE000000
+    g_ctx.rx_queue = (volatile HyperampShmQueue *)g_ctx.shm_base;                             // 0xDE000000
     g_ctx.data_region = (volatile void *)((char *)g_ctx.shm_base + 2 * SHM_QUEUE_SIZE);
     
     printf("[HyperAMP] Memory layout:\n");
@@ -594,8 +591,8 @@ void hyperamp_linux_get_status(void)
     }
     
     printf("[HyperAMP] ========== Queue Status ==========\n");
-    printf("[HyperAMP] TX Queue (Linux -> seL4):\n");
-    
+    printf("[HyperAMP] TX Queue[%p] (Linux -> seL4):\n", g_ctx.tx_queue);
+
     // 安全读取 TX 队列状态
     uint16_t tx_header = hyperamp_safe_read_u16(g_ctx.tx_queue, offsetof(HyperampShmQueue, header));
     uint16_t tx_tail = hyperamp_safe_read_u16(g_ctx.tx_queue, offsetof(HyperampShmQueue, tail));
@@ -621,7 +618,7 @@ void hyperamp_linux_get_status(void)
     printf("[HyperAMP]   lock: value=%u, owner=%u, count=%u, contention=%u\n",
            tx_lock_value, tx_lock_owner, tx_lock_count, tx_lock_contention);
     
-    printf("[HyperAMP] RX Queue (seL4 -> Linux):\n");
+    printf("[HyperAMP] RX Queue[%p] (seL4 -> Linux):\n",g_ctx.rx_queue);
     
     // 安全读取 RX 队列状态
     uint16_t rx_header = hyperamp_safe_read_u16(g_ctx.rx_queue, offsetof(HyperampShmQueue, header));
@@ -662,7 +659,7 @@ static void print_usage(const char *prog)
     printf("Usage: %s [options]\n", prog);
     printf("Options:\n");
     printf("  -c          Create/initialize queues (default: connect to existing)\n");
-    printf("  -a ADDR     Physical address in hex (default: 0x%lx)\n", SHM_TX_QUEUE_PADDR);
+    printf("  -a ADDR     Physical address in hex (default: 0x%lx)\n", SHM_START_PADDR);
     printf("  -s MSG      Send a test message\n");
     printf("  -r          Receive messages\n");
     printf("  -t          Run interactive test\n");
