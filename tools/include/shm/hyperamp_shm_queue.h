@@ -295,7 +295,8 @@ typedef enum {
     HYPERAMP_MSG_TYPE_DEV = 0,     // 设备消息
     HYPERAMP_MSG_TYPE_STRGY = 1,   // 策略消息
     HYPERAMP_MSG_TYPE_SESS = 2,    // 会话消息
-    HYPERAMP_MSG_TYPE_DATA = 3     // 数据消息
+    HYPERAMP_MSG_TYPE_DATA = 3,    // 数据消息
+    HYPERAMP_MSG_TYPE_SERVICE = 0x10 // 服务调用: frontend_sess_id = service_id
 } HyperampMsgType;
 
 /* ==================== 队列配置结构 ==================== */

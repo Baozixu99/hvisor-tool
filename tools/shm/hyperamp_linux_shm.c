@@ -561,9 +561,24 @@ int hyperamp_linux_recv(HyperampMsgHeader *hdr,
 /**
  * @brief 发送原始数据消息 (便捷函数)
  */
+/**
+ * @brief 发送原始数据消息 (便捷函数)
+ */
 int hyperamp_linux_send_data(uint16_t session_id, const void *data, uint16_t data_len)
 {
     return hyperamp_linux_send(HYPERAMP_MSG_TYPE_DATA, session_id, 0, data, data_len);
+}
+
+/**
+ * @brief 发送服务调用消息 (HyperAMP Service Call)
+ * @param service_id 服务ID (0=Echo, 1=Encrypt, 2=Decrypt)
+ * @param data 请求数据
+ * @param data_len 数据长度
+ */
+int hyperamp_linux_call_service(uint16_t service_id, const void *data, uint16_t data_len)
+{
+    // 使用 HYPERAMP_MSG_TYPE_SERVICE 类型，frontend_sess_id 存服务ID
+    return hyperamp_linux_send(HYPERAMP_MSG_TYPE_SERVICE, service_id, 0, data, data_len);
 }
 
 /**
@@ -660,7 +675,10 @@ static void print_usage(const char *prog)
     printf("Options:\n");
     printf("  -c          Create/initialize queues (default: connect to existing)\n");
     printf("  -a ADDR     Physical address in hex (default: 0x%lx)\n", SHM_START_PADDR);
-    printf("  -s MSG      Send a test message\n");
+    printf("  -s MSG      Send a test message (Data type)\n");
+    printf("  -e MSG      Request Encryption Service (ID 1)\n");
+    printf("  -d MSG      Request Decryption Service (ID 2)\n");
+    printf("  -p MSG      Request Echo Service (ID 0)\n");
     printf("  -r          Receive messages\n");
     printf("  -t          Run interactive test\n");
     printf("  -h          Show this help\n");
@@ -674,27 +692,43 @@ int main(int argc, char *argv[])
     int do_recv = 0;
     int do_test = 0;
     char *send_msg = NULL;
+    int service_call_id = -1; // -1 表示无服务调用
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:rth")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:s:e:d:p:rth")) != -1) {
         switch (opt) {
-            case 'c':
+            case 'c':       // Create/initialize queues
                 is_creator = 1;
                 break;
-            case 'a':
-                phys_addr = strtoull(optarg, NULL, 16);
+            case 'a':       // Physical address in hex
+                phys_addr = strtoull(optarg, NULL, 16); //将参数解析为16进制数
                 break;
-            case 's':
+            case 's':       // Send
                 do_send = 1;
                 send_msg = optarg;
                 break;
-            case 'r':
+            case 'e':       // Encrypt
+                do_send = 1;
+                service_call_id = 1;
+                send_msg = optarg;
+                break;
+            case 'd':       // Decrypt
+                do_send = 1;
+                service_call_id = 2;
+                send_msg = optarg;
+                break;
+            case 'p': // Echo
+                do_send = 1;
+                service_call_id = 0;
+                send_msg = optarg;
+                break;
+            case 'r':       // Receive
                 do_recv = 1;
                 break;
-            case 't':
+            case 't':       // Test
                 do_test = 1;
                 break;
-            case 'h':
+            case 'h':       // Help
             default:
                 print_usage(argv[0]);
                 return (opt == 'h') ? 0 : 1;
@@ -713,11 +747,20 @@ int main(int argc, char *argv[])
     
     // 发送测试消息
     if (do_send && send_msg) {
-        printf("\nSending message: %s\n", send_msg);
-        if (hyperamp_linux_send_data(1, send_msg, strlen(send_msg)) == HYPERAMP_OK) {
-            printf("Message sent successfully\n");
+        if (service_call_id >= 0) {
+            printf("\nCalling Service ID %d with data: %s\n", service_call_id, send_msg);
+            if (hyperamp_linux_call_service(service_call_id, send_msg, strlen(send_msg)) == HYPERAMP_OK) {
+                printf("Service request sent successfully\n");
+            } else {
+                printf("Failed to send service request\n");
+            }
         } else {
-            printf("Failed to send message\n");
+            printf("\nSending Data message: %s\n", send_msg);
+            if (hyperamp_linux_send_data(1, send_msg, strlen(send_msg)) == HYPERAMP_OK) {
+                printf("Message sent successfully\n");
+            } else {
+                printf("Failed to send message\n");
+            }
         }
     }
     
