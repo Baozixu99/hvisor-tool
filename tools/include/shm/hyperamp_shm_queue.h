@@ -294,10 +294,24 @@ typedef struct {
 typedef enum {
     HYPERAMP_MSG_TYPE_DEV = 0,     // 设备消息
     HYPERAMP_MSG_TYPE_STRGY = 1,   // 策略消息
-    HYPERAMP_MSG_TYPE_SESS = 2,    // 会话消息
-    HYPERAMP_MSG_TYPE_DATA = 3,    // 数据消息
-    HYPERAMP_MSG_TYPE_SERVICE = 0x10 // 服务调用: frontend_sess_id = service_id
+    HYPERAMP_MSG_TYPE_SESS = 2,    // 会话建立
+    HYPERAMP_MSG_TYPE_DATA = 3,    // 数据传输
+    HYPERAMP_MSG_TYPE_SERVICE = 0x10, // 服务调用: frontend_sess_id = service_id
+    HYPERAMP_MSG_TYPE_BULK = 0x20  // 大数据传输 (Payload为描述符)
 } HyperampMsgType;
+
+
+// Bulk Transfer 配置
+#define BULK_BUFFER_OFFSET        0x100000 // 1MB 偏移处
+#define BULK_BUFFER_SIZE          (2 * 1024 * 1024) // 2MB 大小
+
+// Bulk Transfer 描述符 (作为 Payload 传输)
+typedef struct {
+    uint32_t offset;      // 数据偏移量
+    uint32_t length;      // 数据长度
+    uint32_t service_id;  // 服务 ID (1=Encrypt, 2=Decrypt)
+    uint32_t status;      // 0=Request, 1=Success, <0=Error
+} HyperampBulkDescriptor;
 
 /* ==================== 队列配置结构 ==================== */
 
