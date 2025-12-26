@@ -80,7 +80,7 @@ typedef struct {
     
     volatile HyperampShmQueue *tx_queue;     // Linux → seL4 发送队列
     volatile HyperampShmQueue *rx_queue;     // seL4 → Linux 接收队列
-    volatile void *data_region;              // 数据区基址
+    volatile void *data_region;              // 共享数据区基址 (4MB)
     
     int initialized;                         // 初始化标志
     
@@ -430,7 +430,7 @@ int hyperamp_linux_send(uint8_t msg_type,
     // 入队
     // 重要：数据区使用独立的共享内存区域，而不是队列控制块后面
     // TX Queue 和 RX Queue 只存储队列元数据，实际数据存储在 data_region
-    volatile void *tx_data_base = g_ctx.data_region;
+    volatile void *tx_data_base = g_ctx.data_region;  // 共享数据区
     
     int ret = hyperamp_queue_enqueue(g_ctx.tx_queue, ZONE_ID_LINUX, 
                                       msg_buf, total_len, tx_data_base);
@@ -507,7 +507,7 @@ int hyperamp_linux_recv(HyperampMsgHeader *hdr,
     size_t actual_len = 0;
     // 重要：数据区使用独立的共享内存区域，而不是队列控制块后面
 
-    volatile void *rx_data_base = g_ctx.data_region;
+    volatile void *rx_data_base = g_ctx.data_region;  // 共享数据区
 
     // rx_queue出队，Physical addr: 0xde000000
     int ret = hyperamp_queue_dequeue(g_ctx.rx_queue, ZONE_ID_LINUX,
@@ -679,9 +679,89 @@ static void print_usage(const char *prog)
     printf("  -e MSG      Request Encryption Service (ID 1)\n");
     printf("  -d MSG      Request Decryption Service (ID 2)\n");
     printf("  -p MSG      Request Echo Service (ID 0)\n");
+    printf("  -o FILE     Save response to output file\n");
+    printf("  -w          Wait for response after sending\n");
     printf("  -r          Receive messages\n");
     printf("  -t          Run interactive test\n");
     printf("  -h          Show this help\n");
+    printf("\nFile Input:\n");
+    printf("  Use @filename to read data from file, e.g.:\n");
+    printf("    %s -e @plaintext.txt -o encrypted.bin -w\n", prog);
+    printf("    %s -d @encrypted.bin -o decrypted.txt -w\n", prog);
+}
+
+/**
+ * @brief 从文件读取数据
+ * @param filename 文件名
+ * @param data 输出缓冲区 (需要 free)
+ * @param data_len 输出数据长度
+ * @return 0 成功, -1 失败
+ */
+static int read_file(const char *filename, uint8_t **data, size_t *data_len)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("[HyperAMP] Failed to open input file");
+        return -1;
+    }
+    
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    if (size <= 0 || size > HYPERAMP_MSG_MAX_SIZE) {
+        printf("[HyperAMP] File too large or empty: %ld bytes (max %d)\n", size, HYPERAMP_MSG_MAX_SIZE);
+        fclose(fp);
+        return -1;
+    }
+    
+    *data = (uint8_t *)malloc(size);
+    if (!*data) {
+        perror("[HyperAMP] Failed to allocate memory");
+        fclose(fp);
+        return -1;
+    }
+    
+    size_t read_bytes = fread(*data, 1, size, fp);
+    fclose(fp);
+    
+    if (read_bytes != (size_t)size) {
+        printf("[HyperAMP] Failed to read file: expected %ld, got %zu\n", size, read_bytes);
+        free(*data);
+        *data = NULL;
+        return -1;
+    }
+    
+    *data_len = read_bytes;
+    printf("[HyperAMP] Read %zu bytes from %s\n", read_bytes, filename);
+    return 0;
+}
+
+/**
+ * @brief 将数据写入文件
+ * @param filename 文件名
+ * @param data 数据
+ * @param data_len 数据长度
+ * @return 0 成功, -1 失败
+ */
+static int write_file(const char *filename, const uint8_t *data, size_t data_len)
+{
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("[HyperAMP] Failed to open output file");
+        return -1;
+    }
+    
+    size_t written = fwrite(data, 1, data_len, fp);
+    fclose(fp);
+    
+    if (written != data_len) {
+        printf("[HyperAMP] Failed to write file: expected %zu, wrote %zu\n", data_len, written);
+        return -1;
+    }
+    
+    printf("[HyperAMP] Wrote %zu bytes to %s\n", written, filename);
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -691,11 +771,15 @@ int main(int argc, char *argv[])
     int do_send = 0;
     int do_recv = 0;
     int do_test = 0;
+    int do_wait = 0;  // 等待响应
     char *send_msg = NULL;
+    char *output_file = NULL;  // 输出文件
     int service_call_id = -1; // -1 表示无服务调用
+    uint8_t *file_data = NULL;  // 文件数据
+    size_t file_data_len = 0;
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:e:d:p:rth")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrth")) != -1) {
         switch (opt) {
             case 'c':       // Create/initialize queues
                 is_creator = 1;
@@ -722,6 +806,12 @@ int main(int argc, char *argv[])
                 service_call_id = 0;
                 send_msg = optarg;
                 break;
+            case 'o':       // Output file
+                output_file = optarg;
+                break;
+            case 'w':       // Wait for response
+                do_wait = 1;
+                break;
             case 'r':       // Receive
                 do_recv = 1;
                 break;
@@ -747,20 +837,85 @@ int main(int argc, char *argv[])
     
     // 发送测试消息
     if (do_send && send_msg) {
+        uint8_t *data_to_send = NULL;
+        size_t data_len = 0;
+        int need_free = 0;
+        
+        // 检查是否是文件输入 (@filename)
+        if (send_msg[0] == '@') {
+            const char *filename = send_msg + 1;
+            if (read_file(filename, &file_data, &file_data_len) != 0) {
+                printf("Failed to read input file: %s\n", filename);
+                hyperamp_linux_cleanup();
+                return 1;
+            }
+            data_to_send = file_data;
+            data_len = file_data_len;
+            need_free = 1;
+        } else {
+            data_to_send = (uint8_t *)send_msg;
+            data_len = strlen(send_msg);
+        }
+        
         if (service_call_id >= 0) {
-            printf("\nCalling Service ID %d with data: %s\n", service_call_id, send_msg);
-            if (hyperamp_linux_call_service(service_call_id, send_msg, strlen(send_msg)) == HYPERAMP_OK) {
+            printf("\nCalling Service ID %d with %zu bytes\n", service_call_id, data_len);
+            if (hyperamp_linux_call_service(service_call_id, data_to_send, data_len) == HYPERAMP_OK) {
                 printf("Service request sent successfully\n");
+                
+                // 如果指定了 -w 或 -o，等待响应
+                if (do_wait || output_file) {
+                    printf("\nWaiting for response from seL4...\n");
+                    HyperampMsgHeader hdr;
+                    uint8_t payload[HYPERAMP_MSG_MAX_SIZE];
+                    uint16_t payload_len;
+                    
+                    // 简单轮询等待响应 (最多等待 5 秒)
+                    int timeout = 50;  // 50 * 100ms = 5s
+                    int received = 0;
+                    while (timeout-- > 0 && !received) {
+                        if (hyperamp_linux_recv(&hdr, payload, sizeof(payload), &payload_len) == HYPERAMP_OK) {
+                            printf("\nReceived response: %u bytes\n", payload_len);
+                            
+                            // 保存到文件
+                            if (output_file) {
+                                if (write_file(output_file, payload, payload_len) == 0) {
+                                    printf("✓ Response saved to %s\n", output_file);
+                                }
+                            } else {
+                                // 打印到控制台
+                                printf("Response data:\n");
+                                for (uint16_t i = 0; i < payload_len && i < 64; i++) {
+                                    printf("%02x ", payload[i]);
+                                    if ((i + 1) % 16 == 0) printf("\n");
+                                }
+                                if (payload_len > 64) printf("... (%u bytes total)\n", payload_len);
+                                printf("\n");
+                            }
+                            received = 1;
+                        } else {
+                            usleep(100000);  // 100ms
+                        }
+                    }
+                    
+                    if (!received) {
+                        printf("Timeout waiting for response\n");
+                    }
+                }
             } else {
                 printf("Failed to send service request\n");
             }
         } else {
-            printf("\nSending Data message: %s\n", send_msg);
-            if (hyperamp_linux_send_data(1, send_msg, strlen(send_msg)) == HYPERAMP_OK) {
+            printf("\nSending Data message: %zu bytes\n", data_len);
+            if (hyperamp_linux_send_data(1, data_to_send, data_len) == HYPERAMP_OK) {
                 printf("Message sent successfully\n");
             } else {
                 printf("Failed to send message\n");
             }
+        }
+        
+        if (need_free && file_data) {
+            free(file_data);
+            file_data = NULL;
         }
     }
     
