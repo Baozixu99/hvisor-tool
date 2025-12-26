@@ -695,9 +695,10 @@ static void print_usage(const char *prog)
  * @param filename 文件名
  * @param data 输出缓冲区 (需要 free)
  * @param data_len 输出数据长度
+ * @param max_size 最大允许文件大小 (Bulk模式使用BULK_BUFFER_SIZE, 普通模式使用HYPERAMP_MSG_MAX_SIZE)
  * @return 0 成功, -1 失败
  */
-static int read_file(const char *filename, uint8_t **data, size_t *data_len)
+static int read_file(const char *filename, uint8_t **data, size_t *data_len, size_t max_size)
 {
     FILE *fp = fopen(filename, "rb");
     if (!fp) {
@@ -709,8 +710,8 @@ static int read_file(const char *filename, uint8_t **data, size_t *data_len)
     long size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     
-    if (size <= 0 || size > HYPERAMP_MSG_MAX_SIZE) {
-        printf("[HyperAMP] File too large or empty: %ld bytes (max %d)\n", size, HYPERAMP_MSG_MAX_SIZE);
+    if (size <= 0 || (size_t)size > max_size) {
+        printf("[HyperAMP] File too large or empty: %ld bytes (max %zu)\n", size, max_size);
         fclose(fp);
         return -1;
     }
@@ -764,6 +765,109 @@ static int write_file(const char *filename, const uint8_t *data, size_t data_len
     return 0;
 }
 
+/**
+ * @brief 执行 Bulk Transfer (大文件传输)
+ * 核心逻辑：
+ * 1. 检查数据大小 (< 2MB)
+ * 2. 写入共享内存固定位置 (OFFSET 0x100000)
+ * 3. 发送 BULK 描述符消息
+ * 4. 等待并读取响应结果
+ */
+int hyperamp_linux_bulk_transfer(const void *input_data, size_t input_len, 
+                                void *output_buffer, size_t *output_len, 
+                                uint16_t service_id)
+{
+    if (input_len > BULK_BUFFER_SIZE) {
+        printf("[HyperAMP] Error: Data too large for Bulk Transfer (%zu > %d)\n", 
+               input_len, BULK_BUFFER_SIZE);
+        return HYPERAMP_ERROR;
+    }
+
+    // 1. 准备数据: 写入共享内存
+    // 使用 Data Region 中间部分 (1MB处) 作为临时大缓冲区
+    volatile void *bulk_buf_ptr = (volatile void *)((uintptr_t)g_ctx.data_region + BULK_BUFFER_OFFSET);
+    
+    // Memory copy to Shared Memory
+    volatile uint8_t *dst = (volatile uint8_t *)bulk_buf_ptr;
+    const uint8_t *src = (const uint8_t *)input_data;
+    for (size_t i = 0; i < input_len; i++) {
+        dst[i] = src[i];
+    }
+    
+    // 2. 构造描述符
+    HyperampBulkDescriptor desc = {
+        .offset = BULK_BUFFER_OFFSET,
+        .length = (uint32_t)input_len,
+        .service_id = service_id,
+        .status = 0 // Request
+    };
+
+    printf("[HyperAMP] Bulk Transfer: Writing %zu bytes to offset 0x%x\n", input_len, BULK_BUFFER_OFFSET);
+
+    // 3. 发送消息 (Payload 为描述符)
+    int ret = hyperamp_linux_send(HYPERAMP_MSG_TYPE_BULK, 0, 0, &desc, sizeof(desc));
+    if (ret != HYPERAMP_OK) {
+        printf("[HyperAMP] Failed to send Bulk request\n");
+        return ret;
+    }
+
+    // 4. 等待响应
+    printf("[HyperAMP] Waiting for Bulk response...\n");
+    int timeout_ms = 5000;
+    while (timeout_ms > 0) {
+        if (hyperamp_linux_has_message()) {
+            break;
+        }
+        usleep(1000); // 1ms
+        timeout_ms--;
+    }
+
+    if (timeout_ms <= 0) {
+        printf("[HyperAMP] Timeout waiting for Bulk response\n");
+        return HYPERAMP_ERROR;
+    }
+
+    // 5. 读取响应
+    HyperampMsgHeader hdr;
+    HyperampBulkDescriptor resp_desc;
+    size_t recv_len = sizeof(resp_desc);
+    
+    uint16_t actual_pl_len = 0;
+    ret = hyperamp_linux_recv(&hdr, &resp_desc, (uint16_t)sizeof(resp_desc), &actual_pl_len);
+    if (ret != HYPERAMP_OK) {
+        printf("[HyperAMP] Failed to receive Bulk response\n");
+        return ret;
+    }
+
+    if (hdr.proxy_msg_type != HYPERAMP_MSG_TYPE_BULK) {
+        printf("[HyperAMP] Unexpected response type: 0x%x\n", hdr.proxy_msg_type);
+        return HYPERAMP_ERROR;
+    }
+
+    if (resp_desc.status <= 0) {
+        printf("[HyperAMP] Bulk processing failed on seL4 side (status=%d)\n", resp_desc.status);
+        return HYPERAMP_ERROR;
+    }
+
+    // 6. 读取结果 (从共享内存读回)
+    // 注意: seL4 可能处理后的数据长度不变，也可能变化。这里简单假设长度一致或是 header 中的 length
+    size_t result_len = resp_desc.length;
+    if (result_len > BULK_BUFFER_SIZE) result_len = BULK_BUFFER_SIZE;
+    
+    // Memory copy from Shared Memory
+    volatile uint8_t *bulk_src = (volatile uint8_t *)((uintptr_t)g_ctx.data_region + resp_desc.offset);
+    uint8_t *out_dst = (uint8_t *)output_buffer;
+    
+    for (size_t i = 0; i < result_len; i++) {
+        out_dst[i] = bulk_src[i];
+    }
+    
+    *output_len = result_len;
+    printf("[HyperAMP] Bulk Transfer Complete: Read %zu bytes from offset 0x%x\n", result_len, resp_desc.offset);
+
+    return HYPERAMP_OK;
+}
+
 int main(int argc, char *argv[])
 {
     int is_creator = 0;
@@ -775,11 +879,12 @@ int main(int argc, char *argv[])
     char *send_msg = NULL;
     char *output_file = NULL;  // 输出文件
     int service_call_id = -1; // -1 表示无服务调用
+    int use_bulk = 0;         // 是否使用 Bulk (大数据) 传输
     uint8_t *file_data = NULL;  // 文件数据
     size_t file_data_len = 0;
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrth")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthB")) != -1) {
         switch (opt) {
             case 'c':       // Create/initialize queues
                 is_creator = 1;
@@ -818,6 +923,9 @@ int main(int argc, char *argv[])
             case 't':       // Test
                 do_test = 1;
                 break;
+            case 'B':       // Bulk Transfer
+                use_bulk = 1;
+                break;
             case 'h':       // Help
             default:
                 print_usage(argv[0]);
@@ -844,7 +952,9 @@ int main(int argc, char *argv[])
         // 检查是否是文件输入 (@filename)
         if (send_msg[0] == '@') {
             const char *filename = send_msg + 1;
-            if (read_file(filename, &file_data, &file_data_len) != 0) {
+            // Bulk模式允许最大2MB, 普通模式最大4KB
+            size_t max_file_size = use_bulk ? BULK_BUFFER_SIZE : HYPERAMP_MSG_MAX_SIZE;
+            if (read_file(filename, &file_data, &file_data_len, max_file_size) != 0) {
                 printf("Failed to read input file: %s\n", filename);
                 hyperamp_linux_cleanup();
                 return 1;
@@ -858,51 +968,77 @@ int main(int argc, char *argv[])
         }
         
         if (service_call_id >= 0) {
-            printf("\nCalling Service ID %d with %zu bytes\n", service_call_id, data_len);
-            if (hyperamp_linux_call_service(service_call_id, data_to_send, data_len) == HYPERAMP_OK) {
-                printf("Service request sent successfully\n");
+            if (use_bulk) {
+                // === Bulk Transfer Mode ===
+                printf("\nCalling Service ID %d [BULK MODE] with %zu bytes\n", service_call_id, data_len);
                 
-                // 如果指定了 -w 或 -o，等待响应
-                if (do_wait || output_file) {
-                    printf("\nWaiting for response from seL4...\n");
-                    HyperampMsgHeader hdr;
-                    uint8_t payload[HYPERAMP_MSG_MAX_SIZE];
-                    uint16_t payload_len;
-                    
-                    // 简单轮询等待响应 (最多等待 5 秒)
-                    int timeout = 50;  // 50 * 100ms = 5s
-                    int received = 0;
-                    while (timeout-- > 0 && !received) {
-                        if (hyperamp_linux_recv(&hdr, payload, sizeof(payload), &payload_len) == HYPERAMP_OK) {
-                            printf("\nReceived response: %u bytes\n", payload_len);
-                            
-                            // 保存到文件
-                            if (output_file) {
-                                if (write_file(output_file, payload, payload_len) == 0) {
-                                    printf("✓ Response saved to %s\n", output_file);
-                                }
-                            } else {
-                                // 打印到控制台
-                                printf("Response data:\n");
-                                for (uint16_t i = 0; i < payload_len && i < 64; i++) {
-                                    printf("%02x ", payload[i]);
-                                    if ((i + 1) % 16 == 0) printf("\n");
-                                }
-                                if (payload_len > 64) printf("... (%u bytes total)\n", payload_len);
-                                printf("\n");
+                void *bulk_response_buf = malloc(BULK_BUFFER_SIZE);
+                if (!bulk_response_buf) {
+                    printf("Failed to allocate bulk response buffer\n");
+                } else {
+                    size_t out_len = 0;
+                    if (hyperamp_linux_bulk_transfer(data_to_send, data_len, bulk_response_buf, &out_len, service_call_id) == HYPERAMP_OK) {
+                        printf("\nReceived Bulk response: %zu bytes\n", out_len);
+                        if (output_file) {
+                            if (write_file(output_file, bulk_response_buf, out_len) == 0) {
+                                printf("✓ Response saved to %s\n", output_file);
                             }
-                            received = 1;
                         } else {
-                            usleep(100000);  // 100ms
+                            printf("(Output file not specified, skipping save)\n");
                         }
+                    } else {
+                        printf("Bulk transfer failed\n");
                     }
-                    
-                    if (!received) {
-                        printf("Timeout waiting for response\n");
-                    }
+                    free(bulk_response_buf);
                 }
             } else {
-                printf("Failed to send service request\n");
+                // === Normal Message Mode ===
+                printf("\nCalling Service ID %d with %zu bytes\n", service_call_id, data_len);
+                if (hyperamp_linux_call_service(service_call_id, data_to_send, data_len) == HYPERAMP_OK) {
+                    printf("Service request sent successfully\n");
+                    
+                    // 如果指定了 -w 或 -o，等待响应
+                    if (do_wait || output_file) {
+                        printf("\nWaiting for response from seL4...\n");
+                        HyperampMsgHeader hdr;
+                        uint8_t payload[HYPERAMP_MSG_MAX_SIZE];
+                        uint16_t payload_len;
+                        
+                        // 简单轮询等待响应 (最多等待 5 秒)
+                        int timeout = 50;  // 50 * 100ms = 5s
+                        int received = 0;
+                        while (timeout-- > 0 && !received) {
+                            if (hyperamp_linux_recv(&hdr, payload, sizeof(payload), &payload_len) == HYPERAMP_OK) {
+                                printf("\nReceived response: %u bytes\n", payload_len);
+                                
+                                // 保存到文件
+                                if (output_file) {
+                                    if (write_file(output_file, payload, payload_len) == 0) {
+                                        printf("✓ Response saved to %s\n", output_file);
+                                    }
+                                } else {
+                                    // 打印到控制台
+                                    printf("Response data:\n");
+                                    for (uint16_t i = 0; i < payload_len && i < 64; i++) {
+                                        printf("%02x ", payload[i]);
+                                        if ((i + 1) % 16 == 0) printf("\n");
+                                    }
+                                    if (payload_len > 64) printf("... (%u bytes total)\n", payload_len);
+                                    printf("\n");
+                                }
+                                received = 1;
+                            } else {
+                                usleep(100000);  // 100ms
+                            }
+                        }
+                        
+                        if (!received) {
+                            printf("Timeout waiting for response\n");
+                        }
+                    }
+                } else {
+                    printf("Failed to send service request\n");
+                }
             }
         } else {
             printf("\nSending Data message: %zu bytes\n", data_len);
