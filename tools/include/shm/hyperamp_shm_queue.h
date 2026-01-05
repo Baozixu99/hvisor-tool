@@ -309,9 +309,38 @@ typedef enum {
 typedef struct {
     uint32_t offset;      // 数据偏移量
     uint32_t length;      // 数据长度
-    uint32_t service_id;  // 服务 ID (1=Encrypt, 2=Decrypt)
+    uint32_t service_id;  // 服务 ID (1=Encrypt, 2=Decrypt, 4=VerifyEncrypt, 5=VerifyDecrypt)
     uint32_t status;      // 0=Request, 1=Success, <0=Error
 } HyperampBulkDescriptor;
+
+// ==================== 签名验证 ====================
+
+// Service IDs
+#define SERVICE_ECHO              0
+#define SERVICE_ENCRYPT           1
+#define SERVICE_DECRYPT           2
+#define SERVICE_VERIFY_ONLY       3   // 仅验证签名
+#define SERVICE_VERIFY_ENCRYPT    4   // 验证后加密
+#define SERVICE_VERIFY_DECRYPT    5   // 验证后解密
+
+// 签名验证状态码
+#define AUTH_OK                   0
+#define AUTH_FAILED_BAD_MAGIC    -1
+#define AUTH_FAILED_BAD_SIG      -2
+#define AUTH_FAILED_BAD_LEN      -3
+
+// 签名头魔数
+#define SIG_MAGIC                 0x53494731  // "SIG1"
+
+// 简化版签名头
+typedef struct {
+    uint32_t magic;           // 必须是 SIG_MAGIC (0x53494731)
+    uint16_t sig_len;         // 签名长度 (ECDSA: 70-72字节)
+    uint16_t reserved;
+    uint32_t payload_len;     // 原始数据长度
+    uint8_t  signature[72];   // ECDSA-P256 签名 (最大72字节)
+} __attribute__((packed)) HyperampSignedHeader;
+
 
 /* ==================== 队列配置结构 ==================== */
 
