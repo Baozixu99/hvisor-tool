@@ -884,11 +884,13 @@ int main(int argc, char *argv[])
     char *output_file = NULL;  // 输出文件
     int service_call_id = -1; // -1 表示无服务调用
     int use_bulk = 0;         // 是否使用 Bulk (大数据) 传输
+    int use_signed = 0;       // 是否使用签名验证
+    char *signature_file = NULL; // 签名文件路径
     uint8_t *file_data = NULL;  // 文件数据
     size_t file_data_len = 0;
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthB")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthBS:")) != -1) {
         switch (opt) {
             case 'c':       // Create/initialize queues
                 is_creator = 1;
@@ -929,6 +931,10 @@ int main(int argc, char *argv[])
                 break;
             case 'B':       // Bulk Transfer
                 use_bulk = 1;
+                break;
+            case 'S':       // Signed data (requires signature file)
+                use_signed = 1;
+                signature_file = optarg;
                 break;
             case 'h':       // Help
             default:
@@ -974,14 +980,76 @@ int main(int argc, char *argv[])
         if (service_call_id >= 0) {
             if (use_bulk) {
                 // === Bulk Transfer Mode ===
-                printf("\nCalling Service ID %d [BULK MODE] with %zu bytes\n", service_call_id, data_len);
+                uint8_t *final_data = data_to_send;
+                size_t final_len = data_len;
+                int final_service_id = service_call_id;
+                int free_final_data = 0;
+                
+                // 如果使用签名验证，构造签名数据包
+                if (use_signed && signature_file) {
+                    printf("[HyperAMP] Reading signature from %s\n", signature_file);
+                    
+                    uint8_t *sig_data = NULL;
+                    size_t sig_len = 0;
+                    if (read_file(signature_file, &sig_data, &sig_len, 256) != 0) {
+                        printf("Failed to read signature file: %s\n", signature_file);
+                        if (need_free && file_data) free(file_data);
+                        hyperamp_linux_cleanup();
+                        return 1;
+                    }
+                    
+                    if (sig_len < 64 || sig_len > 72) {
+                        printf("Invalid signature length: %zu (expected 64-72)\n", sig_len);
+                        free(sig_data);
+                        if (need_free && file_data) free(file_data);
+                        hyperamp_linux_cleanup();
+                        return 1;
+                    }
+                    
+                    // 构造签名数据包: SignedHeader + Payload
+                    size_t signed_total = sizeof(HyperampSignedHeader) + data_len;
+                    final_data = malloc(signed_total);
+                    if (!final_data) {
+                        printf("Failed to allocate signed data buffer\n");
+                        free(sig_data);
+                        if (need_free && file_data) free(file_data);
+                        hyperamp_linux_cleanup();
+                        return 1;
+                    }
+                    
+                    HyperampSignedHeader *hdr = (HyperampSignedHeader *)final_data;
+                    hdr->magic = SIG_MAGIC;
+                    hdr->sig_len = (uint16_t)sig_len;
+                    hdr->reserved = 0;
+                    hdr->payload_len = (uint32_t)data_len;
+                    memcpy(hdr->signature, sig_data, sig_len);
+                    memcpy(final_data + sizeof(HyperampSignedHeader), data_to_send, data_len);
+                    
+                    final_len = signed_total;
+                    free_final_data = 1;
+                    free(sig_data);
+                    
+                    // 修改 service_id 为签名验证版本
+                    if (service_call_id == SERVICE_ENCRYPT) {
+                        final_service_id = SERVICE_VERIFY_ENCRYPT;
+                    } else if (service_call_id == SERVICE_DECRYPT) {
+                        final_service_id = SERVICE_VERIFY_DECRYPT;
+                    } else {
+                        final_service_id = SERVICE_VERIFY_ONLY;
+                    }
+                    
+                    printf("[HyperAMP] Constructed signed payload: %zu bytes (sig=%zu, data=%zu)\n",
+                           final_len, sig_len, data_len);
+                }
+                
+                printf("\nCalling Service ID %d [BULK MODE] with %zu bytes\n", final_service_id, final_len);
                 
                 void *bulk_response_buf = malloc(BULK_BUFFER_SIZE);
                 if (!bulk_response_buf) {
                     printf("Failed to allocate bulk response buffer\n");
                 } else {
                     size_t out_len = 0;
-                    if (hyperamp_linux_bulk_transfer(data_to_send, data_len, bulk_response_buf, &out_len, service_call_id) == HYPERAMP_OK) {
+                    if (hyperamp_linux_bulk_transfer(final_data, final_len, bulk_response_buf, &out_len, final_service_id) == HYPERAMP_OK) {
                         printf("\nReceived Bulk response: %zu bytes\n", out_len);
                         if (output_file) {
                             if (write_file(output_file, bulk_response_buf, out_len) == 0) {
@@ -994,6 +1062,10 @@ int main(int argc, char *argv[])
                         printf("Bulk transfer failed\n");
                     }
                     free(bulk_response_buf);
+                }
+                
+                if (free_final_data && final_data) {
+                    free(final_data);
                 }
             } else {
                 // === Normal Message Mode ===
