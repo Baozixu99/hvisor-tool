@@ -310,7 +310,7 @@ typedef struct {
     uint32_t offset;      // 数据偏移量
     uint32_t length;      // 数据长度
     uint32_t service_id;  // 服务 ID (1=Encrypt, 2=Decrypt, 4=VerifyEncrypt, 5=VerifyDecrypt)
-    uint32_t status;      // 0=Request, 1=Success, <0=Error
+    int32_t status;       // 0=Request, 1=Success, <0=Error
 } HyperampBulkDescriptor;
 
 // ==================== 签名验证 ====================
@@ -320,8 +320,14 @@ typedef struct {
 #define SERVICE_ENCRYPT           1
 #define SERVICE_DECRYPT           2
 #define SERVICE_VERIFY_ONLY       3   // 仅验证签名
-#define SERVICE_VERIFY_ENCRYPT    4   // 验证后加密
-#define SERVICE_VERIFY_DECRYPT    5   // 验证后解密
+#define SERVICE_VERIFY_ENCRYPT    4   // 签名验证后加密
+#define SERVICE_VERIFY_DECRYPT    5   // 签名验证后解密
+#define SERVICE_VALIDATE_ENCRYPT  7   // 字段验证后加密 (目标检测数据)
+#define SERVICE_VALIDATE_DECRYPT  8   // 字段验证后解密 (目标检测数据)
+
+// 字段验证状态码
+#define VALIDATE_OK               0
+#define VALIDATE_FAILED_MISSING  -10  // 缺少必需字段
 
 // 签名验证状态码
 #define AUTH_OK                   0

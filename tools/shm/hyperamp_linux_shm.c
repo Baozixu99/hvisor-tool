@@ -881,12 +881,13 @@ int main(int argc, char *argv[])
     int service_call_id = -1; // -1 表示无服务调用
     int use_bulk = 0;         // 是否使用 Bulk (大数据) 传输
     int use_signed = 0;       // 是否使用签名验证
+    int use_validate = 0;     // 是否使用字段验证 (目标检测数据)
     char *signature_file = NULL; // 签名文件路径
     uint8_t *file_data = NULL;  // 文件数据
     size_t file_data_len = 0;
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthBS:")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthBS:V")) != -1) {
         switch (opt) {
             case 'c':       // Create/initialize queues
                 is_creator = 1;
@@ -931,6 +932,9 @@ int main(int argc, char *argv[])
             case 'S':       // Signed data (requires signature file)
                 use_signed = 1;
                 signature_file = optarg;
+                break;
+            case 'V':       // Validate mission data fields
+                use_validate = 1;
                 break;
             case 'h':       // Help
             default:
@@ -980,6 +984,16 @@ int main(int argc, char *argv[])
                 size_t final_len = data_len;
                 int final_service_id = service_call_id;
                 int free_final_data = 0;
+                
+                // 如果使用字段验证模式，修改 service_id
+                if (use_validate) {
+                    if (service_call_id == SERVICE_ENCRYPT) {
+                        final_service_id = SERVICE_VALIDATE_ENCRYPT;
+                    } else if (service_call_id == SERVICE_DECRYPT) {
+                        final_service_id = SERVICE_VALIDATE_DECRYPT;
+                    }
+                    printf("[HyperAMP] Using validation mode (service_id=%d)\n", final_service_id);
+                }
                 
                 // 如果使用签名验证，构造签名数据包
                 if (use_signed && signature_file) {
