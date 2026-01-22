@@ -40,6 +40,9 @@
 #include "hyper_amp_qos.h"  // QoS模块
 #include "hyperamp_client.h"  // HyperAMP 优化客户端
 
+// RTISM command declaration
+extern int rtism_cmd_main(int argc, char* argv[]);
+
 // Global variables for signal handling
 static volatile int running = 1;
 struct timespec start_time;
@@ -63,7 +66,8 @@ static void __attribute__((noreturn)) help(int exit_status) {
     printf("  virtio start  <virtio.json>    Activate virtio devices\n");
     printf("  shm hyper_amp <config> <data> <svc_id>  HyperAMP communication test\n");
     printf("  shm receiver                   Start SHM signal receiver\n");
-    printf("  shm server    <config.json>    Start SHM service server\n\n");
+    printf("  shm server    <config.json>    Start SHM service server\n");
+    printf("  rtism <cmd>   <args>           RTISM Framework Commands (test|lpa)\n\n");
     printf("Options:\n");
     printf("  --id <zone_id>    Specify zone ID for shutdown\n");
     printf("  --help            Show this help message\n\n");
@@ -2896,7 +2900,7 @@ static int hyper_amp_service_test(char* shm_json_path) {
                     // 如果数据被修改，显示处理后的结果
                     if (data_modified) {
                         printf("    *** PROCESSED DATA: [");
-                        for (int i = 0; i < msg->length && i < 32; i++) {
+                        for (uint32_t i = 0; i < msg->length && i < 32; i++) {
                             if (data_ptr[i] >= 32 && data_ptr[i] <= 126) {
                                 printf("%c", data_ptr[i]);
                             } else {
@@ -3440,6 +3444,9 @@ int main(int argc, char *argv[]) {
         else {
             help(1);
         }
+    }
+    else if (strcmp(argv[1], "rtism") == 0) {
+        return rtism_cmd_main(argc - 2, argv + 2);
     }
     else {
         help(1);
