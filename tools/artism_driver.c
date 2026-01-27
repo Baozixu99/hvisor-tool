@@ -4,9 +4,12 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#include <stdint.h>
 #include "hvisor.h"
 #include "shm/artism_shared_memory.h"
 #include "shm/spinlock.h"
+#include "shm/precision_timer.h"  // ARM64 hardware counter (low-overhead)
 
 // ============================================================================
 // Global State
@@ -334,6 +337,197 @@ int main(int argc, char *argv[]) {
         g_mmio_ctrl->ipi_trigger = packed;
         
         printf("[Linux] Done. Run './artism_test log' to check delta in 'Adjustments' count.\n");
+    }
+
+    if (argc > 1 && strcmp(argv[1], "rtt") == 0) {
+        printf("=== RTT Latency Measurement Test ===\n");
+        printf("Following RTISM paper: Linux measures round-trip time.\n");
+        printf("Using ARM64 hardware counter (low-overhead, 20ns precision).\n\n");
+        
+        // Get timer frequency
+        uint64_t timer_freq = get_cntfrq();
+        printf("[Timer] Frequency: %lu Hz (%.2f MHz)\n\n", timer_freq, timer_freq / 1000000.0);
+        
+        int num_probes = 20;  // Number of RTT probes
+        int queue_idx = 0;    // Default Q0, can be changed with arg
+        if (argc > 2) queue_idx = atoi(argv[2]);
+        if (queue_idx < 0 || queue_idx >= ARTISM_NUM_QUEUES) queue_idx = 0;
+        
+        printf("[Linux] Sending %d RTT probes to Q%d...\n", num_probes, queue_idx);
+        
+        // Reset ACK ring
+        g_meta->ack_tail = g_meta->ack_head;
+        __asm__ volatile("dmb sy" ::: "memory");
+        
+        // RTT statistics
+        uint64_t rtt_min = UINT64_MAX;
+        uint64_t rtt_max = 0;
+        uint64_t rtt_sum = 0;
+        int rtt_count = 0;
+        
+        for (int i = 0; i < num_probes; i++) {
+            uint32_t seq_id = i + 1;  // seq_id starts from 1
+            
+            // Build probe message: [seq_id (4 bytes)][payload]
+            uint8_t msg[64];
+            memset(msg, 0, sizeof(msg));
+            *(uint32_t*)msg = seq_id;
+            snprintf((char*)(msg + 4), 60, "RTT_%02d", i);
+            
+            // Record t1 using ARM hardware counter
+            uint64_t t1 = get_cntpct();
+            
+            // Send probe
+            artism_enqueue_smart_ex(queue_idx, msg, strlen((char*)(msg+4)) + 4, ARTISM_TRAFFIC_RT, 0);
+            
+            // Trigger IRQ
+            uint32_t packed = (1 << 16) | 1;
+            __asm__ volatile("dmb sy" ::: "memory");
+            g_mmio_ctrl->ipi_trigger = packed;
+            
+            // Poll for ACK (with timeout)
+            int found = 0;
+            for (int retry = 0; retry < 100000; retry++) {
+                __asm__ volatile("dmb sy" ::: "memory");
+                uint32_t tail = g_meta->ack_tail;
+                uint32_t head = g_meta->ack_head;
+                
+                while (tail != head) {
+                    uint32_t idx = tail % ARTISM_ACK_RING_SIZE;
+                    if (g_meta->ack_ring[idx].status == 1 && 
+                        g_meta->ack_ring[idx].seq_id == seq_id) {
+                        // Found ACK! Record t2
+                        uint64_t t2 = get_cntpct();
+                        uint64_t rtt_ns = ticks_to_ns(t1, t2, timer_freq);
+                        
+                        // Update stats
+                        if (rtt_ns < rtt_min) rtt_min = rtt_ns;
+                        if (rtt_ns > rtt_max) rtt_max = rtt_ns;
+                        rtt_sum += rtt_ns;
+                        rtt_count++;
+                        
+                        printf("  Seq %2d: RTT = %lu ns (%.2f us)\n", seq_id, rtt_ns, rtt_ns / 1000.0);
+                        
+                        // Mark as consumed
+                        g_meta->ack_ring[idx].status = 0;
+                        g_meta->ack_tail = tail + 1;
+                        found = 1;
+                        break;
+                    }
+                    tail++;
+                }
+                if (found) break;
+                usleep(10);  // 10us retry interval
+            }
+            
+            if (!found) {
+                printf("  Seq %2d: TIMEOUT\n", seq_id);
+            }
+        }
+        
+        printf("\n=== RTT Statistics (Q%d) ===\n", queue_idx);
+        if (rtt_count > 0) {
+            printf("  Probes: %d sent, %d received\n", num_probes, rtt_count);
+            printf("  Min RTT: %lu ns (%.2f us)\n", rtt_min, rtt_min / 1000.0);
+            printf("  Max RTT: %lu ns (%.2f us)\n", rtt_max, rtt_max / 1000.0);
+            printf("  Avg RTT: %lu ns (%.2f us)\n", rtt_sum / rtt_count, (rtt_sum / rtt_count) / 1000.0);
+            printf("  Est. One-Way Latency: %.2f us\n", (rtt_sum / rtt_count) / 2000.0);
+        } else {
+            printf("  No ACKs received. Check FreeRTOS logs.\n");
+        }
+    }
+
+    // ========================================================================
+    // HR Blocking Test: Fill queue until dynamic pool exhausted
+    // ========================================================================
+    if (argc > 1 && strcmp(argv[1], "hr") == 0) {
+        printf("=== HR (High-Reliability) Blocking Test ===\n");
+        printf("Goal: Fill Q2 (HR queue) until dynamic pool exhausted, verify blocking.\n\n");
+        
+        int queue_idx = 2;  // Q2 is HR type
+        int sent = 0;
+        int blocked = 0;
+        int dropped = 0;
+        
+        char msg[64];
+        
+        // Try to send 200 packets (more than static + dynamic capacity)
+        printf("[Linux] Sending 200 HR packets to Q%d...\n", queue_idx);
+        for (int i = 0; i < 200; i++) {
+            snprintf(msg, sizeof(msg), "HR_Msg_%d", i);
+            int ret = artism_enqueue_smart_ex(queue_idx, msg, strlen(msg), ARTISM_TRAFFIC_HR, 0);
+            
+            if (ret >= 0) {
+                sent++;
+            } else if (ret == -2) {
+                blocked++;
+                // HR should block/retry, we just count it
+            } else {
+                dropped++;
+            }
+        }
+        
+        printf("\n=== HR Test Results ===\n");
+        printf("  Sent:    %d packets\n", sent);
+        printf("  Blocked: %d packets (HR blocking triggered)\n", blocked);
+        printf("  Dropped: %d packets\n", dropped);
+        
+        if (blocked > 0) {
+            printf("\n[SUCCESS] HR Blocking strategy verified!\n");
+            printf("  When dynamic pool is full, HR packets return -2 (block/retry).\n");
+        } else if (sent == 200) {
+            printf("\n[NOTE] All packets sent. Pool not exhausted.\n");
+        }
+        
+        // Trigger IRQ to let FreeRTOS process
+        printf("\n[Linux] Triggering IRQ...\n");
+        uint32_t packed = (1 << 16) | 1;
+        __asm__ volatile("dmb sy" ::: "memory");
+        g_mmio_ctrl->ipi_trigger = packed;
+    }
+
+    // ========================================================================
+    // BE Drop Test: Fill queue and verify drops
+    // ========================================================================
+    if (argc > 1 && strcmp(argv[1], "be") == 0) {
+        printf("=== BE (Best-Effort) Drop Test ===\n");
+        printf("Goal: Fill Q7 (BE queue) until full, verify drops.\n\n");
+        
+        int queue_idx = 7;  // Q7 is BE type
+        int sent = 0;
+        int dropped = 0;
+        
+        char msg[64];
+        
+        // Try to send 200 packets
+        printf("[Linux] Sending 200 BE packets to Q%d...\n", queue_idx);
+        for (int i = 0; i < 200; i++) {
+            snprintf(msg, sizeof(msg), "BE_Msg_%d", i);
+            int ret = artism_enqueue_smart_ex(queue_idx, msg, strlen(msg), ARTISM_TRAFFIC_BE, 0);
+            
+            if (ret >= 0) {
+                sent++;
+            } else {
+                dropped++;
+            }
+        }
+        
+        printf("\n=== BE Test Results ===\n");
+        printf("  Sent:    %d packets\n", sent);
+        printf("  Dropped: %d packets (BE drop triggered)\n", dropped);
+        
+        if (dropped > 0) {
+            printf("\n[SUCCESS] BE Drop strategy verified!\n");
+            printf("  When queue is full, BE packets are dropped (-1).\n");
+        } else if (sent == 200) {
+            printf("\n[NOTE] All packets sent. Queue not full.\n");
+        }
+        
+        // Trigger IRQ
+        printf("\n[Linux] Triggering IRQ...\n");
+        uint32_t packed = (1 << 16) | 1;
+        __asm__ volatile("dmb sy" ::: "memory");
+        g_mmio_ctrl->ipi_trigger = packed;
     }
     
     return 0;

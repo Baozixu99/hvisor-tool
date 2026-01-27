@@ -16,10 +16,13 @@
 #define ARTISM_NUM_QUEUES       8           // 8 Priority Queues
 #define ARTISM_BLOCKS_PER_Q     16          // 128 / 8 = 16 Blocks (4KB) per Queue
 
-// Layer 2: Dynamic Shared Pool (50%)
-#define ARTISM_DYNAMIC_BLOCKS   128         // 32KB Dynamic Shared
-#define ARTISM_DYNAMIC_START_ID 128         // Dynamic blocks are IDs 128-255
-#define ARTISM_BITMAP_WORDS     2           // 128 bits / 64 bits = 2 words
+// Layer 2: Dynamic Shared Pool (Remaining after static)
+// 64KB total - 16KB meta = 48KB data = 192 blocks
+// Static: 8Q * 16 = 128 blocks
+// Dynamic: 192 - 128 = 64 blocks
+#define ARTISM_DYNAMIC_BLOCKS   64          // 16KB Dynamic Shared (Corrected)
+#define ARTISM_DYNAMIC_START_ID 128         // Dynamic blocks are IDs 128-191
+#define ARTISM_BITMAP_WORDS     1           // 64 bits / 64 bits = 1 word
 
 // Base Address (Partitioned from RTISM/HyperAMP region)
 // We use the same base, assuming ARTISM replaces RTISM in usage
@@ -71,6 +74,17 @@ typedef struct {
     EntryDesc descs[ARTISM_DESC_PER_Q]; // The Ring Buffer of Descriptors
 } ArtismQueue;
 
+// ============================================================================
+// RTT Measurement: ACK Ring Buffer (FreeRTOS -> Linux)
+// ============================================================================
+#define ARTISM_ACK_RING_SIZE    64
+
+typedef struct {
+    volatile uint32_t seq_id;     // Sequence ID from probe
+    volatile uint32_t queue_idx;  // Source queue
+    volatile uint32_t status;     // 0=empty, 1=ready to read
+} ArtismAck;
+
 // 4. Global Manager (Metadata Region)
 typedef struct {
     // Shared Dynamic Pool Management
@@ -82,6 +96,11 @@ typedef struct {
     
     // Debug Buffer for FG-WRR verification
     char debug_buffer[2048];
+    
+    // ACK Ring Buffer for RTT Measurement
+    ArtismAck ack_ring[ARTISM_ACK_RING_SIZE];
+    volatile uint32_t ack_head;  // FreeRTOS writes (increments)
+    volatile uint32_t ack_tail;  // Linux reads (increments)
     
 } __attribute__((aligned(4096))) ArtismMeta; // 4KB aligned for Metadata
 
