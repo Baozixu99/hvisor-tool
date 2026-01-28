@@ -85,11 +85,16 @@ typedef struct {
     volatile uint32_t status;     // 0=empty, 1=ready to read
 } ArtismAck;
 
+// Spinlock (must match FreeRTOS definition exactly for struct alignment!)
+typedef struct {
+    volatile uint32_t flag;
+} ArtismSpinlock;
+
 // 4. Global Manager (Metadata Region)
 typedef struct {
     // Shared Dynamic Pool Management
     volatile uint64_t dynamic_bitmap[ARTISM_BITMAP_WORDS]; // 0=Free, 1=Used
-    ByteFlag bitmap_lock; // Spinlock for bitmap ops (or use atomic instructions)
+    ArtismSpinlock bitmap_lock; // Spinlock for bitmap ops (matches FreeRTOS)
     
     // Per-Queue Management
     ArtismQueue queues[ARTISM_NUM_QUEUES];
@@ -101,6 +106,18 @@ typedef struct {
     ArtismAck ack_ring[ARTISM_ACK_RING_SIZE];
     volatile uint32_t ack_head;  // FreeRTOS writes (increments)
     volatile uint32_t ack_tail;  // Linux reads (increments)
+    
+    // ========================================================================
+    // RTT Profiling: Timestamps at each critical point (FreeRTOS side)
+    // All values are raw counter ticks from cntvct_el0 (50MHz = 20ns/tick)
+    // ========================================================================
+    volatile uint64_t prof_isr_entry;      // When IRQ handler fires
+    volatile uint64_t prof_task_wakeup;    // When server task resumes
+    volatile uint64_t prof_packet_read;    // After reading packet from SHM
+    volatile uint64_t prof_ack_write;      // After writing ACK to ring
+    volatile uint64_t prof_cache_flush;    // After DC CVAC cache clean
+    volatile uint64_t prof_freq;           // Timer frequency for conversion
+    volatile uint32_t prof_seq_id;         // Which seq this profile is for
     
 } __attribute__((aligned(4096))) ArtismMeta; // 4KB aligned for Metadata
 

@@ -365,25 +365,38 @@ int main(int argc, char *argv[]) {
         uint64_t rtt_sum = 0;
         int rtt_count = 0;
         
+        // Linux-side profiling (same VM, valid)
+        uint64_t linux_shm_total = 0;      // SHM enqueue time
+        uint64_t linux_ipi_total = 0;      // MMIO/IPI trigger time
+        uint64_t linux_poll_total = 0;     // Polling detection time
+        
         for (int i = 0; i < num_probes; i++) {
             uint32_t seq_id = i + 1;  // seq_id starts from 1
             
-            // Build probe message: [seq_id (4 bytes)][payload]
+            // Build probe message: [seq_id (4 bytes)][payload (60 bytes)] = 64 bytes total
             uint8_t msg[64];
-            memset(msg, 0, sizeof(msg));
+            memset(msg, 'X', sizeof(msg));  // Fill with 64 bytes of data
             *(uint32_t*)msg = seq_id;
-            snprintf((char*)(msg + 4), 60, "RTT_%02d", i);
+            snprintf((char*)(msg + 4), 60, "RTT_%02d_PAYLOAD_60_BYTES", i);
             
             // Record t1 using ARM hardware counter
             uint64_t t1 = get_cntpct();
             
-            // Send probe
-            artism_enqueue_smart_ex(queue_idx, msg, strlen((char*)(msg+4)) + 4, ARTISM_TRAFFIC_RT, 0);
+            // Send probe (SHM write) - 64 bytes total
+            artism_enqueue_smart_ex(queue_idx, msg, 64, ARTISM_TRAFFIC_RT, 0);
             
-            // Trigger IRQ
+            // [PROFILE] Time after SHM write
+            uint64_t t_after_shm = get_cntpct();
+            
+            // Trigger IRQ (MMIO write to hypervisor)
             uint32_t packed = (1 << 16) | 1;
             __asm__ volatile("dmb sy" ::: "memory");
+            
+            // [PROFILE] Time before MMIO (IPI trigger)
+            uint64_t t_before_ipi = get_cntpct();
             g_mmio_ctrl->ipi_trigger = packed;
+            // [PROFILE] Time after MMIO returns (hypervisor trap + SGI injection done)
+            uint64_t t_after_ipi = get_cntpct();
             
             // Poll for ACK (with timeout)
             int found = 0;
@@ -399,6 +412,14 @@ int main(int argc, char *argv[]) {
                         // Found ACK! Record t2
                         uint64_t t2 = get_cntpct();
                         uint64_t rtt_ns = ticks_to_ns(t1, t2, timer_freq);
+                        
+                        // Linux-side profiling (all same VM, valid)
+                        uint64_t shm_time = ticks_to_ns(t1, t_after_shm, timer_freq);
+                        uint64_t ipi_time = ticks_to_ns(t_before_ipi, t_after_ipi, timer_freq);
+                        uint64_t poll_time = ticks_to_ns(t_after_ipi, t2, timer_freq);
+                        linux_shm_total += shm_time;
+                        linux_ipi_total += ipi_time;
+                        linux_poll_total += poll_time;
                         
                         // Update stats
                         if (rtt_ns < rtt_min) rtt_min = rtt_ns;
@@ -417,7 +438,7 @@ int main(int argc, char *argv[]) {
                     tail++;
                 }
                 if (found) break;
-                usleep(10);  // 10us retry interval
+                // Busy-wait (no usleep) for lowest latency measurement
             }
             
             if (!found) {
@@ -434,6 +455,73 @@ int main(int argc, char *argv[]) {
             printf("  Est. One-Way Latency: %.2f us\n", (rtt_sum / rtt_count) / 2000.0);
         } else {
             printf("  No ACKs received. Check FreeRTOS logs.\n");
+        }
+        
+        // ================================================================
+        // RTT Profile Breakdown (Same-VM Measurements Only)
+        // NOTE: Cannot compare timestamps across VMs (different virtual counter offsets)
+        // ================================================================
+        printf("\n=== RTT Profile Breakdown (Last Packet - Seq %u) ===\n", num_probes);
+        __asm__ volatile("dmb sy" ::: "memory");
+        
+        uint64_t prof_freq = g_meta->prof_freq;
+        
+        // FreeRTOS timestamps (all from same VM, comparable)
+        uint64_t isr_entry = g_meta->prof_isr_entry;
+        uint64_t task_wakeup = g_meta->prof_task_wakeup;
+        uint64_t pkt_read = g_meta->prof_packet_read;
+        uint64_t ack_write = g_meta->prof_ack_write;
+        uint64_t cache_flush = g_meta->prof_cache_flush;
+        
+        printf("  Timer Freq: %lu Hz (%.0f ns/tick)\n\n", prof_freq, 1000000000.0 / prof_freq);
+        
+        if (prof_freq > 0 && isr_entry > 0 && rtt_count > 0) {
+            #define TICKS_TO_NS_LOCAL(ticks) ((ticks) * 1000000000ULL / prof_freq)
+            
+            // FreeRTOS internal intervals (VALID - same VM)
+            uint64_t rtos_isr_to_wakeup = TICKS_TO_NS_LOCAL(task_wakeup - isr_entry);
+            uint64_t rtos_wakeup_to_read = TICKS_TO_NS_LOCAL(pkt_read - task_wakeup);
+            uint64_t rtos_read_to_ack = TICKS_TO_NS_LOCAL(ack_write - pkt_read);
+            uint64_t rtos_ack_to_flush = TICKS_TO_NS_LOCAL(cache_flush - ack_write);
+            uint64_t rtos_total = TICKS_TO_NS_LOCAL(cache_flush - isr_entry);
+            
+            // Total RTT was measured end-to-end within Linux
+            uint64_t total_rtt = rtt_sum / rtt_count;
+            
+            // Cross-VM overhead = Total RTT - FreeRTOS processing - Linux measured
+            uint64_t linux_avg_shm = linux_shm_total / rtt_count;
+            uint64_t linux_avg_ipi = linux_ipi_total / rtt_count;
+            uint64_t linux_avg_poll = linux_poll_total / rtt_count;
+            uint64_t linux_measured = linux_avg_shm + linux_avg_ipi + linux_avg_poll;
+            
+            printf("  ┌─────────────────────────────────────────────────────┐\n");
+            printf("  │ Linux Internal (Same-VM, VALID)                     │\n");
+            printf("  ├─────────────────────────────────────────────────────┤\n");
+            printf("  │ SHM Write (enqueue):        %8lu ns (%6.2f us) │\n", linux_avg_shm, linux_avg_shm / 1000.0);
+            printf("  │ IPI Trigger (MMIO trap):    %8lu ns (%6.2f us) │\n", linux_avg_ipi, linux_avg_ipi / 1000.0);
+            printf("  │ Polling (detect ACK):       %8lu ns (%6.2f us) │\n", linux_avg_poll, linux_avg_poll / 1000.0);
+            printf("  ├─────────────────────────────────────────────────────┤\n");
+            printf("  │ TOTAL Linux Processing:     %8lu ns (%6.2f us) │\n", linux_measured, linux_measured / 1000.0);
+            printf("  └─────────────────────────────────────────────────────┘\n");
+            
+            printf("\n  ┌─────────────────────────────────────────────────────┐\n");
+            printf("  │ FreeRTOS Internal (Same-VM, VALID)                  │\n");
+            printf("  ├─────────────────────────────────────────────────────┤\n");
+            printf("  │ ISR Entry -> Task Wakeup:   %8lu ns (%6.2f us) │\n", rtos_isr_to_wakeup, rtos_isr_to_wakeup / 1000.0);
+            printf("  │ Task Wakeup -> Packet Read: %8lu ns (%6.2f us) │\n", rtos_wakeup_to_read, rtos_wakeup_to_read / 1000.0);
+            printf("  │ Packet Read -> ACK Write:   %8lu ns (%6.2f us) │\n", rtos_read_to_ack, rtos_read_to_ack / 1000.0);
+            printf("  │ ACK Write -> Cache Flush:   %8lu ns (%6.2f us) │\n", rtos_ack_to_flush, rtos_ack_to_flush / 1000.0);
+            printf("  ├─────────────────────────────────────────────────────┤\n");
+            printf("  │ TOTAL FreeRTOS Processing:  %8lu ns (%6.2f us) │\n", rtos_total, rtos_total / 1000.0);
+            printf("  └─────────────────────────────────────────────────────┘\n");
+            
+            printf("\n  === LATENCY SUMMARY ===\n");
+            printf("  Linux (SHM + IPI + Poll): %8lu ns\n", linux_measured);
+            printf("  FreeRTOS Processing:      %8lu ns (parallel with Poll)\n", rtos_total);
+            printf("  -------------------------------------------------\n");
+            printf("  Total RTT (avg):          %8lu ns (%6.2f us)\n", total_rtt, total_rtt / 1000.0);
+        } else {
+            printf("  [No profile data available]\n");
         }
     }
 
