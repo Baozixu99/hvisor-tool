@@ -60,7 +60,8 @@ typedef struct {
 // OR, we maintain a separate Descriptor Ring in the Metadata Region.
 // Let's use Separate Descriptor Ring for efficient scanning.
 
-#define ARTISM_DESC_PER_Q   32 // Allow more descriptors than blocks to handle Dynamic bursts
+// Increased to 64 to ensure WRR scheduler has enough packets to demonstrate weight ratio.
+#define ARTISM_DESC_PER_Q   64
 
 typedef struct {
     volatile uint16_t block_id; // 0-255 (0xFFFF = Invalid)
@@ -100,11 +101,10 @@ typedef struct {
     volatile uint32_t deadline_miss[ARTISM_NUM_QUEUES]; // Deadline violations
     volatile uint32_t max_weight_seen[ARTISM_NUM_QUEUES]; // Max weight reached (for Adaptive test)
     
-    uint32_t _padding[10]; // Pad to align struct size to cache line multiple (6 arrays * 8 queues * 4 bytes = 192 bytes. + 40 bytes padding = 232? No wait.)
-                           // Actually let's just ensure the whole struct size is cache aligned.
-                           // 6 arrays * 8 queues * 4 bytes = 192 bytes.
-                           // 192 is multiple of 64. So padding is optional but good for future proofing.
-                           // Let's keep it simple.
+    // Reset request flag: Linux sets to 1, FreeRTOS clears after reset
+    volatile uint32_t reset_weights_request;
+    
+    uint32_t _padding[9]; // Pad to align struct size to cache line multiple
 } __attribute__((aligned(64))) ArtismDebugStats;
 
 // 4. Global Manager (Metadata Region)
@@ -136,6 +136,22 @@ typedef struct {
     volatile uint64_t prof_cache_flush;    // After DC CVAC cache clean
     volatile uint64_t prof_freq;           // Timer frequency for conversion
     volatile uint32_t prof_seq_id;         // Which seq this profile is for
+    
+    // ========================================================================
+    // Clock Sync Test: Verify cntvct_el0 synchronization across VMs
+    // ========================================================================
+    volatile uint64_t sync_linux_t1;       // Linux writes before IRQ
+    volatile uint64_t sync_freertos_t2;    // FreeRTOS writes after receiving IRQ
+    volatile uint32_t sync_test_flag;      // 0=idle, 1=test requested, 2=test complete
+    
+    // Four-Message Exchange (NTP-style) for accurate offset calculation
+    // Round 1: Linux(t1) -> FreeRTOS(t2)
+    // Round 2: FreeRTOS(t3) -> Linux(t4)
+    volatile uint64_t sync_t1;             // Linux send time (Round 1)
+    volatile uint64_t sync_t2;             // FreeRTOS receive time (Round 1)
+    volatile uint64_t sync_t3;             // FreeRTOS send time (Round 2)
+    volatile uint64_t sync_t4;             // Linux receive time (Round 2)
+    volatile uint32_t sync_phase;          // 0=idle, 1=round1, 2=round2_ready, 3=complete
     
 } __attribute__((aligned(4096))) ArtismMeta; // 4KB aligned for Metadata
 

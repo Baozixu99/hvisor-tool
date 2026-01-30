@@ -80,7 +80,7 @@ hyperamp_backend: hyperamp_backend_proxy_sim.c shm/hyperamp_linux_shm.c
 	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LIBS)
 
 artism_test: $(artism_test_object)
-	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LIBS)
+	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LIBS) -lm
 
 clean:
 	rm -f hvisor ivc_demo rpmsg_demo hyperamp_linux hyperamp_backend artism_test *.o *.d *.d.* virtio_gpu/*.o virtio_gpu/*.d virtio_gpu/*.d.* shm/*.o shm/*.d shm/*.d.*
