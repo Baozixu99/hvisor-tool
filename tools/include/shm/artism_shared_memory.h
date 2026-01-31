@@ -153,6 +153,16 @@ typedef struct {
     volatile uint64_t sync_t4;             // Linux receive time (Round 2)
     volatile uint32_t sync_phase;          // 0=idle, 1=round1, 2=round2_ready, 3=complete
     
+    // ========================================================================
+    // Latency Test: Direct one-way latency measurement (requires synced clocks)
+    // 因为 hvisor 设置了 CNTVOFF_EL2 = 0，Linux 和 FreeRTOS 的 cntvct_el0 是同步的
+    // 可以直接计算单向时延: latency = t2_freertos - t1_linux
+    // ========================================================================
+    volatile uint64_t latency_t2;          // FreeRTOS 接收时间戳 (ticks)
+    volatile uint64_t latency_ns;          // 计算的单向时延 (纳秒)
+    volatile uint32_t latency_count;       // 测量计数
+    volatile uint32_t _latency_padding;    // 对齐填充
+    
 } __attribute__((aligned(4096))) ArtismMeta; // 4KB aligned for Metadata
 
 // 5. Root Structure

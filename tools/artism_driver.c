@@ -913,6 +913,158 @@ int main(int argc, char *argv[]) {
     }
     
     // ========================================================================
+    // Latency Test: 真正的单向时延测量 (利用时钟同步)
+    // 因为 hvisor 设置 CNTVOFF_EL2 = 0，Linux 和 FreeRTOS 使用相同的物理计数器
+    // 可以直接用 FreeRTOS 端的时间戳减去 Linux 端的时间戳得到真实单向时延
+    //
+    // 通信时延分解:
+    //   t1 -> 数据复制(SHM写入) -> IPI注入(MMIO trap) -> 中断处理 -> t2
+    // ========================================================================
+    if (argc > 1 && strcmp(argv[1], "latency") == 0) {
+        printf("╔═══════════════════════════════════════════════════════════════╗\n");
+        printf("║          ARTISM 单向时延测量 (True One-Way Latency)          ║\n");
+        printf("╠═══════════════════════════════════════════════════════════════╣\n");
+        printf("║  原理: hvisor 设置 CNTVOFF_EL2 = 0，两个 VM 时钟已同步        ║\n");
+        printf("║  直接计算 latency = t2_freertos - t1_linux                   ║\n");
+        printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
+        
+        // Get timer frequency
+        uint64_t timer_freq = get_cntfrq();
+        printf("[Timer] Frequency: %lu Hz (%.2f ns/tick)\n\n", timer_freq, 1000000000.0 / timer_freq);
+        
+        int num_probes = 20;
+        int queue_idx = 0;
+        if (argc > 2) num_probes = atoi(argv[2]);
+        if (argc > 3) queue_idx = atoi(argv[3]);
+        if (num_probes < 1) num_probes = 20;
+        if (queue_idx < 0 || queue_idx >= ARTISM_NUM_QUEUES) queue_idx = 0;
+        
+        printf("[Linux] 发送 %d 个时延探测包到 Q%d...\n\n", num_probes, queue_idx);
+        
+        // 清空计数
+        g_meta->latency_count = 0;
+        __asm__ volatile("dmb sy" ::: "memory");
+        
+        // 统计变量
+        uint64_t lat_min = UINT64_MAX, lat_max = 0, lat_sum = 0;
+        uint64_t copy_sum = 0;    // 数据复制时延累计 (t1 -> SHM写入完成)
+        uint64_t ipi_sum = 0;     // IPI注入时延累计 (MMIO trap)
+        uint64_t irq_sum = 0;     // 中断处理时延累计 (ISR入口 -> t2)
+        int lat_count = 0;
+        
+        uint64_t *latencies = malloc(num_probes * sizeof(uint64_t));
+        if (!latencies) { printf("[ERROR] 内存分配失败\n"); return -1; }
+        
+        for (int i = 0; i < num_probes; i++) {
+            // 构造消息: [seq_id: 4B][t1: 8B][padding: 52B] = 64B
+            uint8_t msg[64];
+            memset(msg, 'L', sizeof(msg));
+            *(uint32_t*)msg = 0xFFFF0000 | (i + 1);
+            
+            // === 时延测量开始 ===
+            // t1: 记录发送时间戳，同时写入 payload
+            uint64_t t1 = get_cntpct();
+            *(uint64_t*)(msg + 4) = t1;
+            
+            // 数据复制: 写入 SHM
+            artism_enqueue_smart_ex(queue_idx, msg, 64, ARTISM_TRAFFIC_RT, 0);
+            uint64_t t_after_copy = get_cntpct();
+            
+            // IPI 注入: MMIO trap 触发中断
+            __asm__ volatile("dmb sy" ::: "memory");
+            uint64_t t_before_ipi = get_cntpct();
+            g_mmio_ctrl->ipi_trigger = (1 << 16) | 1;
+            uint64_t t_after_ipi = get_cntpct();
+            
+            // 等待 FreeRTOS 处理完成
+            int found = 0;
+            for (int retry = 0; retry < 100000; retry++) {
+                __asm__ volatile("dc civac, %0" :: "r" (&g_meta->latency_count) : "memory");
+                __asm__ volatile("dsb sy" ::: "memory");
+                
+                if (g_meta->latency_count >= (uint32_t)(i + 1)) {
+                    // 读取结果
+                    __asm__ volatile("dc civac, %0" :: "r" (&g_meta->latency_ns) : "memory");
+                    __asm__ volatile("dc civac, %0" :: "r" (&g_meta->latency_t2) : "memory");
+                    __asm__ volatile("dsb sy" ::: "memory");
+                    
+                    uint64_t latency = g_meta->latency_ns;
+                    uint64_t t2 = g_meta->latency_t2;
+                    
+                    // 计算各阶段时延
+                    uint64_t copy_ns = (t_after_copy - t1) * 1000000000ULL / timer_freq;
+                    uint64_t ipi_ns = (t_after_ipi - t_before_ipi) * 1000000000ULL / timer_freq;
+                    uint64_t irq_ns = (t2 - t_after_ipi) * 1000000000ULL / timer_freq;  // IPI返回 -> t2
+                    
+                    // 累计统计
+                    if (latency < lat_min) lat_min = latency;
+                    if (latency > lat_max) lat_max = latency;
+                    lat_sum += latency;
+                    copy_sum += copy_ns;
+                    ipi_sum += ipi_ns;
+                    irq_sum += irq_ns;
+                    latencies[lat_count++] = latency;
+                    
+                    printf("  Probe %2d: %lu ns (%.2f μs) [Copy=%lu, IPI=%lu, IRQ=%lu]\n",
+                           i + 1, latency, latency / 1000.0, copy_ns, ipi_ns, irq_ns);
+                    
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) printf("  Probe %2d: TIMEOUT\n", i + 1);
+        }
+        
+        // 打印统计结果
+        printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+        printf("║                    单向时延统计 (Q%d)                         ║\n", queue_idx);
+        printf("╠═══════════════════════════════════════════════════════════════╣\n");
+        
+        if (lat_count > 0) {
+            uint64_t lat_avg = lat_sum / lat_count;
+            
+            // 计算标准差
+            double variance = 0.0;
+            for (int i = 0; i < lat_count; i++) {
+                double diff = (double)latencies[i] - (double)lat_avg;
+                variance += diff * diff;
+            }
+            double stddev = sqrt(variance / lat_count);
+            
+            printf("║  探测包: %d 发送, %d 成功                                     ║\n", num_probes, lat_count);
+            printf("╠═══════════════════════════════════════════════════════════════╣\n");
+            printf("║  最小时延: %8lu ns (%6.2f μs)                            ║\n", lat_min, lat_min / 1000.0);
+            printf("║  最大时延: %8lu ns (%6.2f μs)                            ║\n", lat_max, lat_max / 1000.0);
+            printf("║  平均时延: %8lu ns (%6.2f μs)                            ║\n", lat_avg, lat_avg / 1000.0);
+            printf("║  标准差:   %8.0f ns (%6.2f μs)                            ║\n", stddev, stddev / 1000.0);
+            printf("╚═══════════════════════════════════════════════════════════════╝\n");
+            
+            // 平均时延分解
+            printf("\n=== 平均时延分解 ===\n");
+            printf("  ┌──────────────────────────────────────────────────────────┐\n");
+            printf("  │ 阶段                         平均时延                    │\n");
+            printf("  ├──────────────────────────────────────────────────────────┤\n");
+            printf("  │ 1. 数据复制 (SHM写入):      %8lu ns (%6.2f μs)      │\n", 
+                   copy_sum / lat_count, (copy_sum / lat_count) / 1000.0);
+            printf("  │ 2. IPI注入 (MMIO trap):     %8lu ns (%6.2f μs)      │\n", 
+                   ipi_sum / lat_count, (ipi_sum / lat_count) / 1000.0);
+            printf("  │ 3. 中断处理 (IPI->t2):      %8lu ns (%6.2f μs)      │\n", 
+                   irq_sum / lat_count, (irq_sum / lat_count) / 1000.0);
+            printf("  ├──────────────────────────────────────────────────────────┤\n");
+            printf("  │ 总计 (t2 - t1):             %8lu ns (%6.2f μs)      │\n", 
+                   lat_avg, lat_avg / 1000.0);
+            printf("  └──────────────────────────────────────────────────────────┘\n");
+            printf("\n  注: 总计 = 数据复制 + IPI注入 + 中断处理\n");
+            
+        } else {
+            printf("║  未收到任何响应，请检查 FreeRTOS 日志                       ║\n");
+            printf("╚═══════════════════════════════════════════════════════════════╝\n");
+        }
+        
+        free(latencies);
+    }
+    
+    // ========================================================================
     // Clock Sync Test: Verify cntvct_el0 synchronization between Linux & FreeRTOS
     // Enhanced version with:
     //   - 100 samples for statistical significance
