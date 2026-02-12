@@ -25,6 +25,7 @@
 /* 队列操作结果 */
 #define HYPERAMP_OK                     0
 #define HYPERAMP_ERROR                  (-1)
+#define HYPERAMP_AGAIN                  (-2)
 
 /* 内存映射模式 - 与 HighSpeedCProxy 完全一致 */
 typedef enum {
@@ -215,7 +216,7 @@ static inline int hyperamp_spinlock_trylock(volatile HyperampSpinlock *lock, uin
         }
     }
     
-    return HYPERAMP_ERROR;
+    return HYPERAMP_AGAIN;
 }
 
 /* ==================== 地址映射表项 ==================== */
@@ -659,7 +660,7 @@ static inline int hyperamp_queue_enqueue(volatile HyperampShmQueue *queue,
     // 检查是否会导致队列满（header 追上 tail）
     if (new_header == queue->tail) {
         hyperamp_spinlock_unlock(&queue->queue_lock);
-        return HYPERAMP_ERROR;  // 队列满
+        return HYPERAMP_AGAIN;  // 队列满
     }
     
     // 计算数据写入地址：使用当前 header + 1 的位置
@@ -716,7 +717,7 @@ static inline int hyperamp_queue_dequeue(volatile HyperampShmQueue *queue,
     // 检查队列是否为空
     if (queue->tail == queue->header) {
         hyperamp_spinlock_unlock(&queue->queue_lock);
-        return HYPERAMP_ERROR;  // 队列空
+        return HYPERAMP_AGAIN;  // 队列空
     }
     // 计算读取地址：tail + 1 的位置
     uint64_t read_addr = (uint64_t)virt_base + (uint64_t)(queue->tail + 1) * queue->block_size;
@@ -765,7 +766,7 @@ static inline int hyperamp_queue_peek(volatile HyperampShmQueue *queue,
     
     if (queue->tail == queue->header) {
         hyperamp_spinlock_unlock(&queue->queue_lock);
-        return HYPERAMP_ERROR;
+        return HYPERAMP_AGAIN;
     }
     
     uint64_t read_addr = (uint64_t)virt_base + (uint64_t)(queue->tail + 1) * queue->block_size;
@@ -804,7 +805,7 @@ static inline int hyperamp_queue_alloc_slot(volatile HyperampShmQueue *queue,
     
     if (next_header == queue->tail) {
         hyperamp_spinlock_unlock(&queue->queue_lock);
-        return HYPERAMP_ERROR;
+        return HYPERAMP_AGAIN;
     }
     
     // 返回当前可写入的槽位地址
@@ -832,7 +833,7 @@ static inline int hyperamp_queue_release_slot(volatile HyperampShmQueue *queue,
     
     if (queue->tail == queue->header) {
         hyperamp_spinlock_unlock(&queue->queue_lock);
-        return HYPERAMP_ERROR;
+        return HYPERAMP_AGAIN;
     }
     
     uint16_t new_tail = (queue->tail + 1) % queue->capacity;
