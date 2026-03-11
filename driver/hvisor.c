@@ -1037,14 +1037,21 @@ static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
         //     reserved memory\n"); return -EFAULT;
         // }
         
-        // HyperAMP shared memory regions: use uncached mapping
-        // TX Queue: 0x7E000000, RX Queue: 0x7E001000, Data Region: 0x7E002000
+        // HyperAMP memory layout:
+        //   0x7E000000 (4KB): RX Queue control block - NORMAL WB (需要 LDXR/STXR 支持)
+        //   0x7E001000 (4KB): TX Queue control block - NORMAL WB (需要 LDXR/STXR 支持)
+        //   0x7E002000+     : Data Region            - DEVICE_nGnRnE uncached
         unsigned long phys_addr = vma->vm_pgoff << PAGE_SHIFT;
 
-        // HyperAMP shared memory region (0x7E000000 - 0x7E402000, ~4MB)
-        if (phys_addr >= 0x7E000000UL && phys_addr < 0x7E500000UL) {
+        // Queue control blocks: keep default NORMAL WB page_prot for LDXR/STXR support
+        if (phys_addr >= 0x7E000000UL && phys_addr < 0x7E002000UL) {
+            pr_info("HyperAMP queue control block mapped at PA %#lx with NORMAL (cached) protection\n",
+                    phys_addr);
+        }
+        // Data region: DEVICE_nGnRnE uncached
+        else if (phys_addr >= 0x7E002000UL && phys_addr < 0x7E500000UL) {
             vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-            pr_info("HyperAMP shared memory mapped at PA %#lx with uncached protection (size: %#lx)\n", 
+            pr_info("HyperAMP data region mapped at PA %#lx with uncached protection (size: %#lx)\n",
                     phys_addr, size);
             pr_info("  vm_page_prot pgprot value: %#lx (should have non-cacheable bits set)\n",
                     pgprot_val(vma->vm_page_prot));

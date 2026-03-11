@@ -48,60 +48,49 @@ typedef enum {
  * 可以在飞腾派等平台的 uncached 内存上安全工作。
  */
 typedef struct {
-    volatile uint32_t lock_value;     // 0 = 未锁定, 1 = 已锁定
-    volatile uint32_t owner_zone_id;  // 持有锁的 zone ID (用于调试)
-    volatile uint32_t lock_count;     // 加锁次数统计
+    volatile uint32_t lock_value;       // 0 = 未锁定, 1 = 已锁定
+    volatile uint32_t owner_zone_id;    // 持有锁的 zone ID
+    volatile uint32_t lock_count;       // 加锁次数统计
     volatile uint32_t contention_count; // 竞争次数统计
-} __attribute__((packed)) HyperampSpinlock;
+} __attribute__((aligned(4))) HyperampSpinlock;
+/* 注：移除 __packed__，保留 __aligned(4)：
+ *   - lock_value 必须 4 字节对齐以支持 LDAXR/STXR 指令
+ *   - 4 个 uint32_t 自然对齐，sizeof = 16B，无隐式 padding
+ */
 
 /* 内存屏障宏 */
 #if defined(__aarch64__) || defined(__arm__)
     #define HYPERAMP_DMB()   __asm__ volatile("dmb sy" ::: "memory")
-    #define HYPERAMP_DSB()   __asm__ volatile("dsb sy" ::: "memory")
     #define HYPERAMP_ISB()   __asm__ volatile("isb" ::: "memory")
     
-    /* 数据缓存清理 - 将缓存行刷新到主存 (用于共享内存写入) */
+    /* 数据缓存清理 - 仅用于数据区 (DEVICE_nGnRnE uncached)，不用于 Normal 内存的锁 */
     static inline void hyperamp_cache_clean(volatile void *addr, size_t size) {
-        // volatile char *p = (volatile char *)addr;
-        // volatile char *end = p + size;
-        // /* ARM64 缓存行通常是 64 字节 */
-        // for (; p < end; p += 64) {
-        //     __asm__ volatile("dc cvac, %0" : : "r"(p) : "memory");
-        // }
-        // __asm__ volatile("dsb sy" ::: "memory");
-        
         (void)addr; (void)size;
         __asm__ volatile("dmb sy" ::: "memory");
     }
     
-    /* 数据缓存失效 - 丢弃缓存内容，强制从内存读取 (用于共享内存读取) */
+    /* 数据缓存失效 - 仅用于数据区 (DEVICE_nGnRnE uncached)，不用于 Normal 内存的锁 */
     static inline void hyperamp_cache_invalidate(volatile void *addr, size_t size) {
-        // volatile char *p = (volatile char *)addr;
-        // volatile char *end = p + size;
-        // for (; p < end; p += 64) {
-        //     __asm__ volatile("dc ivac, %0" : : "r"(p) : "memory");
-        // }
-        // __asm__ volatile("dsb sy" ::: "memory");
         (void)addr; (void)size;
         __asm__ volatile("dmb sy" ::: "memory");
     }
 #else
-    // #define HYPERAMP_DMB()   __asm__ volatile("mfence" ::: "memory")
-    // #define HYPERAMP_DSB()   __asm__ volatile("mfence" ::: "memory")
-    // #define HYPERAMP_ISB()   __asm__ volatile("" ::: "memory")
+    #define HYPERAMP_DMB()   __asm__ volatile("mfence" ::: "memory")
+    #define HYPERAMP_ISB()   __asm__ volatile("" ::: "memory")
     
-    // static inline void hyperamp_cache_clean(volatile void *addr, size_t size) {
-    //     (void)addr; (void)size;
-    //     __asm__ volatile("mfence" ::: "memory");
-    // }
+    static inline void hyperamp_cache_clean(volatile void *addr, size_t size) {
+        (void)addr; (void)size;
+        __asm__ volatile("mfence" ::: "memory");
+    }
     
-    // static inline void hyperamp_cache_invalidate(volatile void *addr, size_t size) {
-    //     (void)addr; (void)size;
-    //     __asm__ volatile("mfence" ::: "memory");
-    // }
+    static inline void hyperamp_cache_invalidate(volatile void *addr, size_t size) {
+        (void)addr; (void)size;
+        __asm__ volatile("mfence" ::: "memory");
+    }
 #endif
 
-#define HYPERAMP_BARRIER()   do { HYPERAMP_DMB(); HYPERAMP_DSB(); } while(0)
+/* HYPERAMP_BARRIER 仅使用 DMB：DSB 已由 LDXR/STLXR 内置语义取代 */
+#define HYPERAMP_BARRIER()   HYPERAMP_DMB()
 
 /**
  * @brief 初始化自旋锁
@@ -109,114 +98,117 @@ typedef struct {
 static inline void hyperamp_spinlock_init(volatile HyperampSpinlock *lock)
 {
     if (!lock) return;
-    
-    volatile uint8_t *p = (volatile uint8_t *)lock;
-    for (size_t i = 0; i < sizeof(HyperampSpinlock); i++) {
-        p[i] = 0;
-    }
+    lock->lock_value       = 0;
+    lock->owner_zone_id    = 0;
+    lock->lock_count       = 0;
+    lock->contention_count = 0;
     HYPERAMP_BARRIER();
-    
-    /* 刷新锁状态到主存 */
-    hyperamp_cache_clean((volatile void *)lock, sizeof(HyperampSpinlock));
 }
 
 /**
- * @brief 获取自旋锁 (纯软件实现，无原子指令)
- * @param lock 锁指针
- * @param zone_id 当前 zone 的 ID (用于调试)
+ * @brief 获取自旋锁
+ *
+ * ARM64: 使用 LDAXR (Load-Acquire Exclusive) + STLXR (Store-Release Exclusive)。
+ * 要求 lock_value 所在内存为 NORMAL 类型 (WB)；DEVICE_nGnRnE 内存不支持独占访问指令。
  */
 static inline void hyperamp_spinlock_lock(volatile HyperampSpinlock *lock, uint32_t zone_id)
 {
     if (!lock) return;
-    
-    int spin_count = 0;
-    const int max_spin = 100000;
-    
+#if defined(__aarch64__)
+    uint32_t tmp, newval;
+    __asm__ volatile(
+        "1: ldaxr   %w0, %2\n"       /* Load-Acquire Exclusive: tmp = lock_value  */
+        "   cbnz    %w0, 1b\n"       /* 已被占用则自旋等待                        */
+        "   mov     %w1, #1\n"
+        "   stlxr   %w0, %w1, %2\n" /* Store-Release Exclusive: lock_value = 1  */
+        "   cbnz    %w0, 1b\n"       /* 独占写失败则重试                          */
+        : "=&r" (tmp), "=&r" (newval), "+Q" (lock->lock_value)
+        :
+        : "memory"
+    );
+    /* LDAXR/STLXR 已提供 acquire 语义，无需额外屏障 */
+    lock->owner_zone_id = zone_id;
+    lock->lock_count++;
+#else
+    /* 非 ARM64 保留软件实现 */
     while (1) {
         HYPERAMP_BARRIER();
-        
-        volatile uint32_t current = lock->lock_value;
-        
-        if (current == 0) {
-            // 尝试获取锁
+        if (lock->lock_value == 0) {
             lock->lock_value = 1;
             HYPERAMP_BARRIER();
-            
-            // 验证是否成功获取
-            volatile uint32_t verify = lock->lock_value;
-            if (verify == 1) {
+            if (lock->lock_value == 1) {
                 lock->owner_zone_id = zone_id;
                 lock->lock_count++;
-                HYPERAMP_BARRIER();
-                
-                /* 刷新锁状态到主存，确保其他核心/虚拟机能看到锁已被占用 */
-                hyperamp_cache_clean((volatile void *)lock, sizeof(HyperampSpinlock));
-                return;  // 成功获取锁
+                return;
             }
         }
-        
-        // 锁被占用，自旋等待
         lock->contention_count++;
-        spin_count++;
-        
-        // 简单的退避策略
-        if (spin_count > max_spin) {
-            spin_count = 0;
-#if defined(__aarch64__) || defined(__arm__)
-            __asm__ volatile("yield" ::: "memory");
-#else
-            __asm__ volatile("pause" ::: "memory");
-#endif
-        }
-        
-        // 短暂延迟
-        for (volatile int i = 0; i < 100; i++) {
-            HYPERAMP_BARRIER();
-        }
+        __asm__ volatile("pause" ::: "memory");
     }
+#endif
 }
 
 /**
  * @brief 释放自旋锁
+ *
+ * ARM64: 使用 STLR (Store-Release) 确保 release 语义，无需额外 DMB/DSB。
  */
 static inline void hyperamp_spinlock_unlock(volatile HyperampSpinlock *lock)
 {
     if (!lock) return;
-    
-    HYPERAMP_BARRIER();
     lock->owner_zone_id = 0;
+#if defined(__aarch64__)
+    __asm__ volatile(
+        "stlr    wzr, %0\n"  /* Store-Release: lock_value = 0，保证 release 语义 */
+        : "+Q" (lock->lock_value)
+        :
+        : "memory"
+    );
+#else
+    HYPERAMP_BARRIER();
     lock->lock_value = 0;
     HYPERAMP_BARRIER();
-    
-    /* 关键：刷新锁状态到主存，确保其他核心/虚拟机能看到锁已释放 */
-    hyperamp_cache_clean((volatile void *)lock, sizeof(HyperampSpinlock));
+#endif
 }
 
 /**
  * @brief 尝试获取自旋锁（非阻塞）
- * @return 0 成功获取锁, -1 锁被占用
+ * @return HYPERAMP_OK(0) 成功获取锁, HYPERAMP_AGAIN(-2) 锁已被占用
  */
 static inline int hyperamp_spinlock_trylock(volatile HyperampSpinlock *lock, uint32_t zone_id)
 {
     if (!lock) return HYPERAMP_ERROR;
-    
+#if defined(__aarch64__)
+    uint32_t tmp, newval;
+    __asm__ volatile(
+        "ldaxr   %w0, %2\n"       /* Load-Acquire Exclusive: tmp = lock_value */
+        "cbnz    %w0, 1f\n"       /* 已被占用，直接跳到结束 (tmp != 0)        */
+        "mov     %w1, #1\n"
+        "stlxr   %w0, %w1, %2\n" /* Store-Release Exclusive; tmp=0 成功       */
+        "1:\n"
+        : "=&r" (tmp), "=&r" (newval), "+Q" (lock->lock_value)
+        :
+        : "memory"
+    );
+    if (tmp == 0) {
+        lock->owner_zone_id = zone_id;
+        lock->lock_count++;
+        return HYPERAMP_OK;
+    }
+    return HYPERAMP_AGAIN;
+#else
     HYPERAMP_BARRIER();
-    volatile uint32_t current = lock->lock_value;
-    
-    if (current == 0) {
+    if (lock->lock_value == 0) {
         lock->lock_value = 1;
         HYPERAMP_BARRIER();
-        
-        volatile uint32_t verify = lock->lock_value;
-        if (verify == 1) {
+        if (lock->lock_value == 1) {
             lock->owner_zone_id = zone_id;
             lock->lock_count++;
-            HYPERAMP_BARRIER();
             return HYPERAMP_OK;
         }
     }
-    
     return HYPERAMP_AGAIN;
+#endif
 }
 
 /* ==================== 地址映射表项 ==================== */
@@ -274,6 +266,16 @@ typedef struct {
     uint32_t dequeue_count;       // 出队计数
     
 } __attribute__((packed)) HyperampShmQueue;
+
+/* 静态断言：验证 queue_lock.lock_value 在共享内存中满足 LDAXR/STXR 所需的 4 字节对齐 */
+_Static_assert(offsetof(HyperampShmQueue, queue_lock) % 4 == 0,
+               "HyperampShmQueue.queue_lock must be 4-byte aligned for LDAXR/STXR");
+_Static_assert(sizeof(HyperampSpinlock) == 16,
+               "HyperampSpinlock size must be 16 bytes");
+
+/* 安全获取 packed 结构体中 queue_lock 的指针（避免 -Waddress-of-packed-member） */
+#define HYPERAMP_QUEUE_LOCK(q) \
+    ((volatile HyperampSpinlock *)((volatile uint8_t *)(q) + offsetof(HyperampShmQueue, queue_lock)))
 
 /* 魔数定义 */
 #define HYPERAMP_QUEUE_MAGIC        0x48415150  // "HAQP" - HyperAmp Queue Protocol
@@ -649,7 +651,7 @@ static inline int hyperamp_queue_enqueue(volatile HyperampShmQueue *queue,
     if (data_len > queue->block_size) return HYPERAMP_ERROR;
     
     // 获取锁
-    hyperamp_spinlock_lock(&queue->queue_lock, zone_id);
+    hyperamp_spinlock_lock(HYPERAMP_QUEUE_LOCK(queue), zone_id);
     
     // 计算新的 header
     uint16_t new_header = queue->header + 1;
@@ -659,7 +661,7 @@ static inline int hyperamp_queue_enqueue(volatile HyperampShmQueue *queue,
     
     // 检查是否会导致队列满（header 追上 tail）
     if (new_header == queue->tail) {
-        hyperamp_spinlock_unlock(&queue->queue_lock);
+        hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
         return HYPERAMP_AGAIN;  // 队列满
     }
     
@@ -683,7 +685,7 @@ static inline int hyperamp_queue_enqueue(volatile HyperampShmQueue *queue,
     hyperamp_cache_clean((volatile void *)queue, 64);
     
     // 释放锁
-    hyperamp_spinlock_unlock(&queue->queue_lock);
+    hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
     
     return HYPERAMP_OK;
 }
@@ -711,12 +713,12 @@ static inline int hyperamp_queue_dequeue(volatile HyperampShmQueue *queue,
     hyperamp_cache_invalidate((volatile void *)queue, 64);
     
     // 获取锁
-    hyperamp_spinlock_lock(&queue->queue_lock, zone_id);
+    hyperamp_spinlock_lock(HYPERAMP_QUEUE_LOCK(queue), zone_id);
     // printf("[HyperAmp] Dequeue: header=%d, tail=%d\n", queue->header, queue->tail);
     // fflush(stdout);
     // 检查队列是否为空
     if (queue->tail == queue->header) {
-        hyperamp_spinlock_unlock(&queue->queue_lock);
+        hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
         return HYPERAMP_AGAIN;  // 队列空
     }
     // 计算读取地址：tail + 1 的位置
@@ -746,7 +748,7 @@ static inline int hyperamp_queue_dequeue(volatile HyperampShmQueue *queue,
     HYPERAMP_BARRIER();
     
     // 释放锁
-    hyperamp_spinlock_unlock(&queue->queue_lock);
+    hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
     return HYPERAMP_OK;
 }
 
@@ -762,10 +764,10 @@ static inline int hyperamp_queue_peek(volatile HyperampShmQueue *queue,
 {
     if (!queue || !data || max_len == 0) return HYPERAMP_ERROR;
     
-    hyperamp_spinlock_lock(&queue->queue_lock, zone_id);
+    hyperamp_spinlock_lock(HYPERAMP_QUEUE_LOCK(queue), zone_id);
     
     if (queue->tail == queue->header) {
-        hyperamp_spinlock_unlock(&queue->queue_lock);
+        hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
         return HYPERAMP_AGAIN;
     }
     
@@ -779,7 +781,7 @@ static inline int hyperamp_queue_peek(volatile HyperampShmQueue *queue,
     }
     
     HYPERAMP_BARRIER();
-    hyperamp_spinlock_unlock(&queue->queue_lock);
+    hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
     
     return HYPERAMP_OK;
 }
@@ -799,12 +801,12 @@ static inline int hyperamp_queue_alloc_slot(volatile HyperampShmQueue *queue,
 {
     if (!queue || !slot_addr) return HYPERAMP_ERROR;
     
-    hyperamp_spinlock_lock(&queue->queue_lock, zone_id);
+    hyperamp_spinlock_lock(HYPERAMP_QUEUE_LOCK(queue), zone_id);
     
     uint16_t next_header = (queue->header + 1) % queue->capacity;
     
     if (next_header == queue->tail) {
-        hyperamp_spinlock_unlock(&queue->queue_lock);
+        hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
         return HYPERAMP_AGAIN;
     }
     
@@ -816,7 +818,7 @@ static inline int hyperamp_queue_alloc_slot(volatile HyperampShmQueue *queue,
     queue->enqueue_count++;
     
     HYPERAMP_BARRIER();
-    hyperamp_spinlock_unlock(&queue->queue_lock);
+    hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
     
     return HYPERAMP_OK;
 }
@@ -829,10 +831,10 @@ static inline int hyperamp_queue_release_slot(volatile HyperampShmQueue *queue,
 {
     if (!queue) return HYPERAMP_ERROR;
     
-    hyperamp_spinlock_lock(&queue->queue_lock, zone_id);
+    hyperamp_spinlock_lock(HYPERAMP_QUEUE_LOCK(queue), zone_id);
     
     if (queue->tail == queue->header) {
-        hyperamp_spinlock_unlock(&queue->queue_lock);
+        hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
         return HYPERAMP_AGAIN;
     }
     
@@ -841,7 +843,7 @@ static inline int hyperamp_queue_release_slot(volatile HyperampShmQueue *queue,
     queue->dequeue_count++;
     
     HYPERAMP_BARRIER();
-    hyperamp_spinlock_unlock(&queue->queue_lock);
+    hyperamp_spinlock_unlock(HYPERAMP_QUEUE_LOCK(queue));
     
     return HYPERAMP_OK;
 }
