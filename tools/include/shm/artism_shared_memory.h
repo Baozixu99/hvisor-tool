@@ -5,7 +5,7 @@
 #include "spinlock.h"
 
 // ============================================================================
-// ARTISM Memory Constants (Fair Comparison to RTISM)
+// ARTISM Memory Constants (Frozen Architecture - 4 Queues = 4 Semantics)
 // ============================================================================
 #define ARTISM_TOTAL_SIZE       0x10000     // 64KB Total (Same as RTISM)
 #define ARTISM_BLOCK_SIZE       256         // 256 Bytes per Block
@@ -13,12 +13,18 @@
 
 // Layer 1: Static Reserve (50%)
 #define ARTISM_STATIC_BLOCKS    128         // 32KB Total Static
-#define ARTISM_NUM_QUEUES       8           // 8 Priority Queues
-#define ARTISM_BLOCKS_PER_Q     16          // 128 / 8 = 16 Blocks (4KB) per Queue
+#define ARTISM_NUM_QUEUES       4           // 4 Priority Queues (1:1 semantic binding)
+#define ARTISM_BLOCKS_PER_Q     32          // 128 / 4 = 32 Blocks (8KB) per Queue
+
+// Queue Index Constants (Semantic Binding)
+#define ARTISM_Q_RT             0           // Real-Time Queue
+#define ARTISM_Q_HR             1           // High-Reliability Queue
+#define ARTISM_Q_HT             2           // High-Throughput Queue
+#define ARTISM_Q_BE             3           // Best-Effort Queue
 
 // Layer 2: Dynamic Shared Pool (Remaining after static)
 // 64KB total - 16KB meta = 48KB data = 192 blocks
-// Static: 8Q * 16 = 128 blocks
+// Static: 4Q * 32 = 128 blocks
 // Dynamic: 192 - 128 = 64 blocks
 #define ARTISM_DYNAMIC_BLOCKS   64          // 16KB Dynamic Shared (Corrected)
 #define ARTISM_DYNAMIC_START_ID 128         // Dynamic blocks are IDs 128-191
@@ -33,6 +39,13 @@
 #define ARTISM_TRAFFIC_HR       1  // High-Reliability (Blocking)
 #define ARTISM_TRAFFIC_HT       2  // High-Throughput (Borrowing)
 #define ARTISM_TRAFFIC_BE       3  // Best-Effort (Drop)
+
+// Semantic Helpers (Criticality Policy)
+// RT and HR are critical: static pool only
+// HT and BE are non-critical: can borrow from dynamic pool
+// RISK-04 FIX: Unified style with FreeRTOS side (artism_def.h uses <= comparison)
+#define ARTISM_IS_CRITICAL(q)      ((q) <= ARTISM_Q_HR)
+#define ARTISM_CAN_USE_DYNAMIC(t)  ((t) == ARTISM_TRAFFIC_HT || (t) == ARTISM_TRAFFIC_BE)
 
 // ============================================================================
 // Data Structures
