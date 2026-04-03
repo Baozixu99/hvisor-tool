@@ -4,7 +4,8 @@ ivc_demo_object ?= ivc_demo.o
 rpmsg_demo_object ?= rpmsg_demo.o
 hyperamp_backend_object ?= hyperamp_backend_proxy_sim.o
 artism_test_object ?= artism_driver.o
-hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object) $(hyperamp_backend_object) $(artism_test_object), $(objects))
+rtism_test_object ?= rtism_driver.o rtism_lpa.o
+hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object) $(hyperamp_backend_object) $(artism_test_object) $(rtism_test_object), $(objects))
 ROOT ?= /
 
 CFLAGS := -Wall -Wextra -DLOG_USE_COLOR -DHLOG=$(LOG) --sysroot=$(ROOT)
@@ -53,7 +54,7 @@ endif
 
 .PHONY: all clean
 
-all: hvisor ivc_demo rpmsg_demo hyperamp_linux hyperamp_backend artism_test
+all: hvisor ivc_demo rpmsg_demo hyperamp_linux hyperamp_backend artism_test rtism_test
 
 %.d: %.c
 	@set -e; rm -f $@; \
@@ -82,5 +83,8 @@ hyperamp_backend: hyperamp_backend_proxy_sim.c shm/hyperamp_linux_shm.c
 artism_test: $(artism_test_object)
 	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LIBS) -lm
 
+rtism_test: $(rtism_test_object)
+	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LIBS) -lm
+
 clean:
-	rm -f hvisor ivc_demo rpmsg_demo hyperamp_linux hyperamp_backend artism_test *.o *.d *.d.* virtio_gpu/*.o virtio_gpu/*.d virtio_gpu/*.d.* shm/*.o shm/*.d shm/*.d.*
+	rm -f hvisor ivc_demo rpmsg_demo hyperamp_linux hyperamp_backend artism_test rtism_test *.o *.d *.d.* virtio_gpu/*.o virtio_gpu/*.d virtio_gpu/*.d.* shm/*.o shm/*.d shm/*.d.*

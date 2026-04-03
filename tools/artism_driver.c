@@ -886,7 +886,7 @@ int main(int argc, char *argv[]) {
         if (argc > 2) num_probes = atoi(argv[2]);
         if (argc > 3) queue_idx = atoi(argv[3]);
         if (num_probes < 10) num_probes = 10;
-        if (num_probes > 10000) num_probes = 10000;
+        if (num_probes > 50000) num_probes = 50000;
         
         uint64_t timer_freq = get_cntfrq();
         
@@ -960,6 +960,92 @@ int main(int argc, char *argv[]) {
                     printf("%d,%d,-1\n", q, seq_id);  // -1 = timeout
                 }
             }
+        }
+    }
+
+    // ========================================================================
+    // EXPERIMENT: Message Size Sensitivity (rtt_size)
+    // Purpose: RTT vs payload size (64B, 256B, 512B, 1KB, 4KB) on Q0 (RT)
+    // Usage: ./artism_test rtt_size [num_probes]
+    // Output: CSV with size, seq, rtt_ns
+    // ========================================================================
+    if (argc > 1 && strcmp(argv[1], "rtt_size") == 0) {
+        int num_probes = 200;
+        if (argc > 2) num_probes = atoi(argv[2]);
+        if (num_probes < 10) num_probes = 10;
+        if (num_probes > 10000) num_probes = 10000;
+        
+        uint64_t timer_freq = get_cntfrq();
+        int sizes[] = {64, 256, 512, 1024, 4096};
+        int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+        
+        printf("size,seq,rtt_ns\n");
+        
+        for (int s = 0; s < num_sizes; s++) {
+            int sz = sizes[s];
+            uint8_t* msg = malloc(sz);
+            if (!msg) continue;
+            
+            // 重置 ACK ring
+            g_meta->ack_tail = g_meta->ack_head;
+            __asm__ volatile("dmb sy" ::: "memory");
+            
+            // 预热 5 次（丢弃）
+            for (int w = 0; w < 5; w++) {
+                memset(msg, 'W', sz);
+                *(uint32_t*)msg = 0xFFFF;
+                artism_enqueue_smart_ex(ARTISM_Q_RT, msg, sz, ARTISM_TRAFFIC_RT, 1);
+                for (int r = 0; r < 100000; r++) {
+                    __asm__ volatile("dmb sy" ::: "memory");
+                    if (g_meta->ack_tail != g_meta->ack_head) {
+                        g_meta->ack_tail = g_meta->ack_head;
+                        break;
+                    }
+                }
+                usleep(200);
+            }
+            g_meta->ack_tail = g_meta->ack_head;
+            __asm__ volatile("dmb sy" ::: "memory");
+            
+            // 正式测量
+            for (int i = 0; i < num_probes; i++) {
+                uint32_t seq_id = i + 1;
+                memset(msg, 'X', sz);
+                *(uint32_t*)msg = seq_id;
+                
+                uint64_t t1 = get_cntpct();
+                artism_enqueue_smart_ex(ARTISM_Q_RT, msg, sz, ARTISM_TRAFFIC_RT, 0);
+                
+                uint32_t packed = (1 << 16) | 1;
+                __asm__ volatile("dmb sy" ::: "memory");
+                g_mmio_ctrl->ipi_trigger = packed;
+                
+                int found = 0;
+                for (int retry = 0; retry < 200000; retry++) {
+                    __asm__ volatile("dmb sy" ::: "memory");
+                    uint32_t tail = g_meta->ack_tail;
+                    uint32_t head = g_meta->ack_head;
+                    while (tail != head) {
+                        uint32_t idx = tail % ARTISM_ACK_RING_SIZE;
+                        if (g_meta->ack_ring[idx].status == 1 &&
+                            g_meta->ack_ring[idx].seq_id == seq_id) {
+                            uint64_t t2 = get_cntpct();
+                            uint64_t rtt_ns = ticks_to_ns(t1, t2, timer_freq);
+                            printf("%d,%d,%lu\n", sz, seq_id, rtt_ns);
+                            g_meta->ack_ring[idx].status = 0;
+                            g_meta->ack_tail = tail + 1;
+                            found = 1;
+                            break;
+                        }
+                        tail++;
+                    }
+                    if (found) break;
+                }
+                if (!found) printf("%d,%d,-1\n", sz, seq_id);
+                usleep(50);
+            }
+            free(msg);
+            usleep(50000);
         }
     }
 
@@ -1077,7 +1163,7 @@ int main(int argc, char *argv[]) {
         int num_probes = 200;
         if (argc > 2) num_probes = atoi(argv[2]);
         if (num_probes < 20) num_probes = 20;
-        if (num_probes > 2000) num_probes = 2000;
+        if (num_probes > 10000) num_probes = 10000;
         
         uint64_t timer_freq = get_cntfrq();
         

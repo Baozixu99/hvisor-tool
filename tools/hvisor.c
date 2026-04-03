@@ -40,8 +40,7 @@
 #include "hyper_amp_qos.h"  // QoS模块
 #include "hyperamp_client.h"  // HyperAMP 优化客户端
 
-// RTISM command declaration
-extern int rtism_cmd_main(int argc, char* argv[]);
+
 
 // Global variables for signal handling
 static volatile int running = 1;
@@ -3445,9 +3444,7 @@ int main(int argc, char *argv[]) {
             help(1);
         }
     }
-    else if (strcmp(argv[1], "rtism") == 0) {
-        return rtism_cmd_main(argc - 2, argv + 2);
-    }
+
     else {
         help(1);
     }
