@@ -204,7 +204,7 @@ int main(int argc, char *argv[])
     
     // 初始化 HyperAMP（连接 seL4 已初始化的队列）
     printf("[Backend] Initializing HyperAMP as CONNECTOR (waiting for seL4 to initialize queues)...\n");
-    if (hyperamp_linux_init(0, 0) != HYPERAMP_OK) {  // is_creator=0（等待 seL4 初始化）
+    if (hyperamp_linux_init(0x7E000000UL, 0) != HYPERAMP_OK) {  // is_creator=0（等待 seL4 初始化）
         printf("[Backend] ERROR: Failed to initialize HyperAMP\n");
         printf("[Backend] Make sure you have root permissions and /dev/mem access!\n");
         return 1;

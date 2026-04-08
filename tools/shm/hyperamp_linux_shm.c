@@ -56,15 +56,30 @@
 /* ==================== 配置定义 ==================== */
 
 /* 共享内存物理地址 - 新版 HyperAMP 布局 (双向通信) */
-//实际上只用mmap起始地址SHM_START_PADDR并加上SHM_DATA_SIZE就行了
+//实际上只用mmap起始地址SHM_START_PADDR并加上data_size就行了
 //phytium平台
 // #define SHM_START_PADDR          0xDE000000UL  // 共享内存起始物理地址
 //imx8MP平台
-#define SHM_START_PADDR             0x7E000000UL  // 共享内存起始物理地址
-#define SHM_QUEUE_SIZE              (4 * 1024)    // 4KB 队列控制区 (实际 ~4068 bytes)
-#define SHM_DATA_SIZE               (4 * 1024 * 1024)  // 4MB 数据区
+// 通道布局说明：每个通道占用一段连续物理空间，格式为
+//   [RX Queue 4KB] + [TX Queue 4KB] + [Data Region 4MB] + [Unused Padding]
+// 当前设定步长为 6MB (0x600000)，其中 4.01MB 有效使用，其余约 1.99MB 作为预留/对齐空间。
+// 这样做目的：保证每个通道起始地址 4MB 对齐，避免跨通道传播冲突，便于按需扩展。
+// 单通道内部地址：
+//   RX Queue 起始 = base
+//   TX Queue 起始 = base + 4KB
+//   Data Region 起始 = base + 8KB
+//   Data Region 长度 = 4MB
+//   通道步长 = 6MB
+#define SHM_START_PADDR             0x7E000000UL  // CH0 物理地址：0x7E000000 (Size: 2MB)
+#define SHM_CH1_PADDR               0x7E200000UL  // CH1 物理地址 (Compact layout)
+#define SHM_CH2_PADDR               0x7E300000UL  // CH2 物理地址 (Compact layout)
 
-#define SHM_TOTAL_SIZE              (SHM_QUEUE_SIZE * 2 + SHM_DATA_SIZE)  // 总计约 4.01MB
+#define SHM_QUEUE_SIZE              (4 * 1024)    // 4KB 队列控制区 (实际约4068 bytes)
+#define SHM_CH0_DATA_SIZE           (2 * 1024 * 1024 - SHM_QUEUE_SIZE * 2)
+#define SHM_CH1_DATA_SIZE           (1 * 1024 * 1024 - SHM_QUEUE_SIZE * 2)
+#define SHM_CH2_DATA_SIZE           (1 * 1024 * 1024 - SHM_QUEUE_SIZE * 2)
+
+////#define SHM_TOTAL_SIZE              (SHM_QUEUE_SIZE * 2 + data_size)  // 总计约 4.01MB
 
 /* 队列配置 */
 #define DEFAULT_QUEUE_CAPACITY      256
@@ -191,7 +206,14 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
     printf("[HyperAMP] Physical address: 0x%lx\n", phys_addr);
     
     // 映射物理内存 (从 TX Queue 开始,映射整个区域)
-    if (map_physical_memory(phys_addr, SHM_TOTAL_SIZE) != HYPERAMP_OK) {
+    
+    size_t map_size = 2 * 1024 * 1024;
+    size_t data_size = SHM_CH0_DATA_SIZE;
+    if (phys_addr == SHM_CH1_PADDR) { map_size = 1 * 1024 * 1024; data_size = SHM_CH1_DATA_SIZE; }
+    else if (phys_addr == SHM_CH2_PADDR) { map_size = 1 * 1024 * 1024; data_size = SHM_CH2_DATA_SIZE; }
+    else { map_size = 2 * 1024 * 1024; data_size = SHM_CH0_DATA_SIZE; }
+    if (map_physical_memory(phys_addr, map_size) != HYPERAMP_OK)
+     {
         return HYPERAMP_ERROR;
     }
     
@@ -212,7 +234,7 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
     printf("[HyperAMP]   RX Queue:    %p (phys: 0x%lx)\n", 
            g_ctx.rx_queue, phys_addr);
     printf("[HyperAMP]   Data Region: %p (phys: 0x%lx, size: %d bytes)\n", 
-           g_ctx.data_region, phys_addr + 2 * SHM_QUEUE_SIZE, SHM_DATA_SIZE);
+           g_ctx.data_region, phys_addr + 2 * SHM_QUEUE_SIZE, data_size);
     
     // 初始化队列配置
     HyperampQueueConfig tx_config = {
@@ -250,7 +272,7 @@ int hyperamp_linux_init(uint64_t phys_addr, int is_creator)
         
         // 清空数据区
         printf("[HyperAMP] Clearing data region...\n");
-        hyperamp_safe_memset(g_ctx.data_region, 0, SHM_DATA_SIZE);
+        hyperamp_safe_memset(g_ctx.data_region, 0, data_size);
     } else {
         // 等待队列被初始化 (检查 capacity 字段而不是 magic,因为 magic 超出 4KB 边界)
         printf("[HyperAMP] Connecting to existing queues (no wait mode)...\n");

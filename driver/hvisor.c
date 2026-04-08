@@ -1037,19 +1037,32 @@ static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
         //     reserved memory\n"); return -EFAULT;
         // }
         
-        // HyperAMP memory layout:
+        // HyperAMP memory layout (Extended to 3 channels, Stride: 0x600000):
+        // CH0:
         //   0x7E000000 (4KB): RX Queue control block - NORMAL WB (需要 LDXR/STXR 支持)
         //   0x7E001000 (4KB): TX Queue control block - NORMAL WB (需要 LDXR/STXR 支持)
         //   0x7E002000+     : Data Region            - DEVICE_nGnRnE uncached
+        // CH1: RX/TX 0x7E600000~0x7E602000, Data 0x7E602000+
+        // CH2: RX/TX 0x7EC00000~0x7EC02000, Data 0x7EC02000+
         unsigned long phys_addr = vma->vm_pgoff << PAGE_SHIFT;
 
-        // Queue control blocks: keep default NORMAL WB page_prot for LDXR/STXR support
-        if (phys_addr >= 0x7E000000UL && phys_addr < 0x7E002000UL) {
-            pr_info("HyperAMP queue control block mapped at PA %#lx with NORMAL (cached) protection\n",
-                    phys_addr);
+        // 【潜在隐患提醒】
+        // 注意：目前用户态 (hyperamp_linux_shm.c) 调用了单次总跨度为 ~4MB 的 mmap()。
+        // Linux 内核中，一个 mmap() 对应的整个 VMA 只能拥有一套 vma->vm_page_prot 缓存属性。
+        // 因此如果单次映射跨越了 Queue 区和 Data 区，仅会以首次命中的条件 (通常是 Cached) 覆盖全局。
+        // 现阶段依赖应用层的 CACHE_INVALIDATE 发挥作用。未来如需严格对齐硬件 Uncached，请在用户态分两次 mmap()。
+
+        // Queue control blocks (CH0, CH1, CH2 in compact 4MB layout)
+        if ((phys_addr >= 0x7E000000UL && phys_addr < 0x7E002000UL) || // CH0
+            (phys_addr >= 0x7E200000UL && phys_addr < 0x7E202000UL) || // CH1
+            (phys_addr >= 0x7E300000UL && phys_addr < 0x7E302000UL)) { // CH2
+            pr_info("HyperAMP queue compact block mapped at PA %#lx with NORMAL protection\n", phys_addr);
         }
-        // Data region: DEVICE_nGnRnE uncached
-        else if (phys_addr >= 0x7E002000UL && phys_addr < 0x7E500000UL) {
+        // Data region (CH0, CH1, CH2): DEVICE_nGnRnE uncached
+        else if ((phys_addr >= 0x7E002000UL && phys_addr < 0x7E200000UL) || // CH0 Data (2MB)
+                 (phys_addr >= 0x7E202000UL && phys_addr < 0x7E300000UL) || // CH1 Data (1MB)
+                 (phys_addr >= 0x7E302000UL && phys_addr < 0x7E400000UL) || // CH2 Data (1MB)
+                 (phys_addr >= 0x7DE00000UL && phys_addr < 0x7E000000UL)) {
             vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
             pr_info("HyperAMP data region mapped at PA %#lx with uncached protection (size: %#lx)\n",
                     phys_addr, size);
