@@ -117,3 +117,28 @@ ipcBuf[4] = shm_data_vaddr + 0x301000UL;  // CH2 的 RX 寻址
 ipcBuf[5] = shm_data_vaddr + 0x302000UL;  // CH2 的 数据区寻址
 ```
 然后重新使用 `ninja` 编译 seL4 镜像，让它把属于 CH2 的通道虚拟指针指引交给应用。
+
+---
+
+## 6. 常见故障排查：Bulk 大文件传输截断与噪点问题
+
+在将 CH0 从 4MB 缩减为 2MB 后，使用大文件（Bulk）传输模式（`-B`，例如加解密高清图片）时，极易踩到以下两个深坑：
+
+### 6.1 问题一：部分文件或下半部分图像截断（越界）
+**现象**：`hyperamp_linux_bulk_transfer()` 发送超过约 1MB 的图片时，底层 seL4 服务直接拒绝服务或 Linux 端发生段错误。
+**原因**：
+- **偏移写死引起挤兑**：`BULK_BUFFER_OFFSET` 一直硬编码为 `1MB`。当 CH0 整体只有 2MB 时，留给 Bulk 的空间仅剩不足 1MB（扣除队列头部）。
+- **容量宏未同步**：Linux 端的 `BULK_BUFFER_SIZE` 仍被定义为 2MB，而 seL4 端的安全防御边界 `SHM_DATA_SIZE` 更是写死了 4MB，导致越界写入覆盖了未映射的高位物理内存。
+**解决办法**：
+- 修改 `tools/include/shm/hyperamp_shm_queue.h` 中的 `BULK_BUFFER_SIZE` 适配新通道剩余容量（如 `1MB - 8192` 或 `2MB - 8192`）。
+- 同步修改 seL4 测试应用（`main.c`）中的 `SHM_DATA_SIZE`，让其安检逻辑真正匹配当前通道上限（2MB）。
+
+### 6.2 问题二：图像成功解密，但下半部分变为严重噪点（多核缓存不一致）
+**现象**：发送 ~800KB 的图片，接收后体积一字节不差，但图像上半部清晰，下半部全是毫无规律的雪花噪点。
+**原因（跨域 CPU Cache Coherency 冲突）**：
+- **映射不对称**：Linux 端驱动的映射为 `Uncached (DEVICE_nGnRnE)`，直接往物理 RAM 进行数据读写；而 seL4 端使用 `NORMAL` 属性映射通道，默认启用了 CPU 的 L1/L2 Cache。
+- **缓存冲刷不同步**：seL4 读取加密图片时，前半段（核心独占的 L2 Cache大小约为 256KB 或 512KB）由于缓存塞满，自动触发了硬件层面的 Eviction 驱逐刷入物理内存（这也就是为什么图像**上半部分**是正常的）；但剩余的后半段数据稳稳停留在 seL4 核心的 L1/L2 Cache 内部，并未写回物理内存（RAM）。
+- **致命读取**：随后 Linux 收到完成状态，循着它的 Uncached 通道去实体的 RAM 内存条上捞数据，结果下半部分捞出来的全是老旧的内存垃圾（残影），便表现为严重的噪点乱码。
+**解决办法（Cache Maintenance Operations - CMO）**：
+- **读取前失效 (Invalidate)**：在 seL4 端 `process_bulk_message()` 处理数据前，必须调用 `hyperamp_cache_invalidate` 强制失效该段 CPU Cache，强迫 CPU 越过缓存去物理 RAM 读取 Linux 刚刚实打实放上去的新鲜数据。
+- **写入后清洗 (Clean)**：在 seL4 修改/加密完数据后，在通过 TX Queue 回复指令之前，必须调用 `hyperamp_cache_clean`，将 CPU 肚子里的加密结果强行冲刷（Flush）到物理 RAM 内存条上，确保后续 Linux 在 Uncached 通道读取的绝对安全与一致。

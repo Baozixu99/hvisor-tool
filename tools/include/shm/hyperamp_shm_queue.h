@@ -306,7 +306,7 @@ typedef enum {
 
 // Bulk Transfer 配置
 #define BULK_BUFFER_OFFSET        0x100000 // 1MB 偏移处
-#define BULK_BUFFER_SIZE          (2 * 1024 * 1024) // 2MB 大小
+#define BULK_BUFFER_SIZE          (1 * 1024 * 1024 - 8192) // 修改为适配 CH0 缩减后的容量，最大可用 1MB-8KB
 
 // Bulk Transfer 描述符 (作为 Payload 传输)
 typedef struct {
