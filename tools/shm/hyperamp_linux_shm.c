@@ -701,6 +701,7 @@ static void print_usage(const char *prog)
     printf("Options:\n");
     printf("  -c          Create/initialize queues (default: connect to existing)\n");
     printf("  -a ADDR     Physical address in hex (default: 0x%lx)\n", SHM_START_PADDR);
+    printf("  -n ID       Channel ID (0, 1, or 2). Automatically sets address.\n");
     printf("  -s MSG      Send a test message (Data type)\n");
     printf("  -e MSG      Request Encryption Service (ID 1)\n");
     printf("  -d MSG      Request Decryption Service (ID 2)\n");
@@ -913,13 +914,22 @@ int main(int argc, char *argv[])
     size_t file_data_len = 0;
     
     int opt;
-    while ((opt = getopt(argc, argv, "ca:s:e:d:p:o:wrthBS:V")) != -1) {
+    while ((opt = getopt(argc, argv, "ca:n:s:e:d:p:o:wrthBS:V")) != -1) {
         switch (opt) {
             case 'c':       // Create/initialize queues
                 is_creator = 1;
                 break;
             case 'a':       // Physical address in hex
                 phys_addr = strtoull(optarg, NULL, 16); //将参数解析为16进制数
+                break;
+            case 'n':       // Channel ID
+                {
+                    int ch_id = atoi(optarg);
+                    if (ch_id == 0) phys_addr = SHM_START_PADDR;
+                    else if (ch_id == 1) phys_addr = SHM_CH1_PADDR;
+                    else if (ch_id == 2) phys_addr = SHM_CH2_PADDR;
+                    else printf("[HyperAMP] Warning: Invalid channel ID %d, using default\n", ch_id);
+                }
                 break;
             case 's':       // Send
                 do_send = 1;
