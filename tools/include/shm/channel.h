@@ -19,6 +19,8 @@ struct ChannelOps
   int32_t (*channel_is_ready)(struct Channel* channel);
   /* 获取发往目标核心的通道 */
   struct Channel* (*target_channel_get)(uint32_t target_zone_id);
+  /* 通过通道ID获取通道 */
+  struct Channel* (*target_channel_get_by_id)(uint32_t channel_id);
   /* 向指定通道发送核间消息通知 */
   int32_t (*channel_notify)(struct Channel* channel);
   /* 从通道中获取一个空闲消息缓冲区 */
