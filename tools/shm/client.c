@@ -154,7 +154,44 @@ static int32_t client_init(struct Client* raw_client, uint32_t remote_zone_id)
   return 0;
 }
 
-static int32_t client_destory(struct Client* client)
+static int32_t client_init_by_channel(struct Client* raw_client, uint32_t channel_id)
+{
+  ASSERT(raw_client!= NULL);
+
+  if (channel_ops.channels_init() != 0)
+  {
+      printf("client_init_error: channels init fail\n");
+      while(1) {}
+  }
+
+  struct Channel* target_channel = channel_ops.target_channel_get_by_id(channel_id);
+
+  if (target_channel == NULL)
+  {
+      printf("client_init_error: get target channel fail = %u\n", channel_id);
+      while(1) {}
+  }
+
+  printf("Channel %u is ready (assumed for multi-channel test)!\n", channel_id);
+
+  target_channel->msg_queue->working_mark = MSG_QUEUE_MARK_IDLE;
+
+  raw_client->remote_channel = target_channel;
+  raw_client->msg_cnt = 0U;
+  raw_client->shm_cnt = 0U;
+
+  if (shm_ops.shm_init() != 0)
+  {
+    printf("client_init_error: init shm fail\n");
+    while(1) {}
+  }
+
+  set_r21_zero();
+  return 0;
+}
+
+static int32_t client_destory(struct Client *client)
+
 {
   // printf("client_destory_info: client destory\n");
 
@@ -307,6 +344,7 @@ static void set_client_request_cnt(struct Client* client)
 struct ClientOps client_ops = 
 {
     .client_init = client_init,
+    .client_init_by_channel = client_init_by_channel,
     .client_destory = client_destory,
     .empty_msg_get = client_empty_msg_get,
     .empty_msg_put = client_empty_msg_put,
