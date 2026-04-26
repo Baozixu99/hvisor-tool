@@ -24,5 +24,7 @@ extern struct ChannelInfo channel_infos[];
 
 // alias for convenience
 #define LINUX_2_NPUCore_CHANNEL_INFO (&channel_infos[0])
+#define LINUX_2_NPUCore_CH1_CHANNEL_INFO (&channel_infos[1])
+#define LINUX_2_NPUCore_CH2_CHANNEL_INFO (&channel_infos[2])
 
 #endif // _CONFIG_CHANNEL_H_
