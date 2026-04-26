@@ -31,13 +31,32 @@ struct ZoneInfo zone_infos[] =
 // GLOBAL ADDRESS INFOS
 struct AddrInfo addr_infos[] =
 {
-  { /* 0： Linux 地址空间下使用的共享内存地址信息 4MB */
-      .start = 0x0, // TODO: get from .json
-      .len = 0
+  { /* 0: CH0 Linux Buffer */
+      .start = 0x0, .len = 0
   },
-  { /* 1: Linux 地址空间下发送给 NPUCore 的环形缓冲区 4KB */
-      .start = 0x0U,// TODO: get from .json
-      .len = 0
+  { /* 1: CH0 Linux -> NPUCore Queue */
+      .start = 0x0, .len = 0
+  },
+  { /* 2: CH0 NPUCore Queue (Remote) */
+      .start = 0x0, .len = 0
+  },
+  { /* 3: CH1 Linux Buffer */
+      .start = 0x0, .len = 0
+  },
+  { /* 4: CH1 Linux -> NPUCore Queue */
+      .start = 0x0, .len = 0
+  },
+  { /* 5: CH1 NPUCore Queue (Remote) */
+      .start = 0x0, .len = 0
+  },
+  { /* 6: CH2 Linux Buffer */
+      .start = 0x0, .len = 0
+  },
+  { /* 7: CH2 Linux -> NPUCore Queue */
+      .start = 0x0, .len = 0
+  },
+  { /* 8: CH2 NPUCore Queue (Remote) */
+      .start = 0x0, .len = 0
   },
 };
 
@@ -45,15 +64,32 @@ struct AddrInfo addr_infos[] =
 /* channel_cfg.h */
 struct ChannelInfo channel_infos[] = 
 {
-    { /* 通道1： RootLinux -> NPUcore */
-      .channel_id = 1,
-      .irq_req = 74, // SWI1
-      .irq_rsp = 74, // SWI1 // TODO: modify it 
+    { /* 通道0： RootLinux -> NPUcore */
+      .channel_id = 0,
+      .irq_req = 74,
+      .irq_rsp = 74,
       .src_zone = LINUX_ZONE_INFO,
       .dst_zone = NPUCORE_ZONE_INFO,
       .src_queue = LINUX_2_NPUCore_MSG_QUEUE_ADDR_INFO,
       .dst_queue = NPUCore_2_NPUCore_MSG_QUEUE_ADDR_INFO
-      // used in address space of NPUCore
+    },
+    { /* 通道1： RootLinux -> NPUcore CH1 */
+      .channel_id = 1,
+      .irq_req = 74,
+      .irq_rsp = 74,
+      .src_zone = LINUX_ZONE_INFO,
+      .dst_zone = NPUCORE_ZONE_INFO,
+      .src_queue = LINUX_2_NPUCore_CH1_MSG_QUEUE_ADDR_INFO,
+      .dst_queue = NPUCore_2_NPUCore_CH1_MSG_QUEUE_ADDR_INFO
+    },
+    { /* 通道2： RootLinux -> NPUcore CH2 */
+      .channel_id = 2,
+      .irq_req = 74,
+      .irq_rsp = 74,
+      .src_zone = LINUX_ZONE_INFO,
+      .dst_zone = NPUCORE_ZONE_INFO,
+      .src_queue = LINUX_2_NPUCore_CH2_MSG_QUEUE_ADDR_INFO,
+      .dst_queue = NPUCore_2_NPUCore_CH2_MSG_QUEUE_ADDR_INFO
     },
     { /* null */
       .src_zone = NULL
@@ -63,12 +99,28 @@ struct ChannelInfo channel_infos[] =
 /* shm_cfg.h */
 struct ShmCfg shm_cfgs[] = 
 {
-  { /* Linux  共享内存配置信息 */
+  { /* Linux CH0 共享内存配置信息 */
     .zone = LINUX_ZONE_INFO,
     .zone_shm = LINUX_SHM_BUF_ADDR_INFO,
-    .pblock_size = (2 * MB),
-    .vblock_size = (2 * MB),
-    .min_block_size = (512 * B),// TODO: check it
+    .pblock_size = (1 * MB), // CH0 is 2MB total, split p/v
+    .vblock_size = (1 * MB),
+    .min_block_size = (512 * B),
+    .bit_align = MEMORY_ALIGN_SIZE
+  },
+  { /* Linux CH1 共享内存配置信息 */
+    .zone = LINUX_ZONE_INFO,
+    .zone_shm = LINUX_SHM_CH1_BUF_ADDR_INFO,
+    .pblock_size = (512 * KB), // CH1 is 1MB total
+    .vblock_size = (512 * KB),
+    .min_block_size = (512 * B),
+    .bit_align = MEMORY_ALIGN_SIZE
+  },
+  { /* Linux CH2 共享内存配置信息 */
+    .zone = LINUX_ZONE_INFO,
+    .zone_shm = LINUX_SHM_CH2_BUF_ADDR_INFO,
+    .pblock_size = (512 * KB), // CH2 is 1MB total
+    .vblock_size = (512 * KB),
+    .min_block_size = (512 * B),
     .bit_align = MEMORY_ALIGN_SIZE
   },
   {
