@@ -4,10 +4,12 @@ ivc_demo_object ?= ivc_demo.o
 rpmsg_demo_object ?= rpmsg_demo.o
 hyperamp_backend_object ?= hyperamp_backend_proxy_sim.o
 hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object) $(hyperamp_backend_object), $(objects))
-ROOT ?= /
+ROOT ?= /opt/arm-gnu-toolchain-11.3.rel1-x86_64-aarch64-none-linux-gnu/lib64/
+# CFLAGS := -Wall -Wextra -DLOG_USE_COLOR -DHLOG=$(LOG) --sysroot=$(ROOT)
+CFLAGS := -Wall -Wextra -DLOG_USE_COLOR -DHLOG=$(LOG)
 
-CFLAGS := -Wall -Wextra -DLOG_USE_COLOR -DHLOG=$(LOG) --sysroot=$(ROOT)
 include_dirs := -I../include -I./include -I../cJSON -lpthread -static
+
 LIBS := -L$(ROOT)/usr/lib/aarch64-linux-gnu -L$(ROOT)/lib
 ifeq ($(VIRTIO_GPU), y)
 	sources += $(wildcard ./virtio_gpu/*.c)
@@ -28,9 +30,9 @@ else
 endif
 
 ifeq ($(ARCH), arm64)
-	CC := aarch64-linux-gnu-gcc
-	READELF := aarch64-linux-gnu-readelf
-	OBJDUMP := aarch64-linux-gnu-objdump
+	CC := aarch64-none-linux-gnu-gcc
+	READELF := aarch64-none-linux-gnu-readelf
+	OBJDUMP := aarch64-none-linux-gnu-objdump
 	ifeq ($(VIRTIO_GPU), y)
 		include_dirs += -I/usr/aarch64-linux-gnu/include -I/usr/aarch64-linux-gnu/include/libdrm -L/usr/aarch64-linux-gnu/lib -ldrm 
 	endif
