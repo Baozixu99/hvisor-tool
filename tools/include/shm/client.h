@@ -25,6 +25,7 @@ struct Client
 struct ClientOps
 {
   int32_t (*client_init)(struct Client *raw_client, uint32_t remote_zone_id); // client init
+  int32_t (*client_init_by_channel)(struct Client *raw_client, uint32_t channel_id); // client init by channel id
   int32_t (*client_destory)(struct Client *client);   // client destory
   struct Msg *(*empty_msg_get)(struct Client *client, uint32_t remote_service_id); /* 获取一个空闲的消息缓冲区 */
   int32_t (*empty_msg_put)(struct Client *client, struct Msg *empty_msg);          /* 归还空闲消息缓冲区：归任务管理的缓冲区才需要手动归还 */

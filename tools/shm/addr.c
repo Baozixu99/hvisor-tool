@@ -40,7 +40,7 @@ void parse_global_addr(char *shm_json_path) {
     if (!strcmp(region_flag, "linux-2-npucore-buf")) {
       addr_infos[0].start = zone0_ram_ipa;
       addr_infos[0].len = mem_size;
-      printf("[Attention] linux-2-npucore-buf: start: 0x%llx, len: 0x%llx\n", addr_infos[0].start, addr_infos[0].len);
+      printf("[Attention] linux-2-npucore-buf: start: 0x%llx, len: 0x%llx\n", (unsigned long long)addr_infos[0].start, (unsigned long long)addr_infos[0].len);
     } else if(!strcmp(region_flag, "linux-2-npucore-msg")) {
       // special for msg queue (sender and receiver)
       addr_infos[1].start = zone0_ram_ipa;
@@ -48,8 +48,34 @@ void parse_global_addr(char *shm_json_path) {
       addr_infos[2].start = zonex_ram_ipa;
       addr_infos[2].len = mem_size;
       printf("[Attention] linux-2-npucore-msg: zone0_ram_ipa: 0x%llx, len: 0x%llx, zonex_ram_ipa: 0x%llx, len: 0x%llx\n", 
-         addr_infos[1].start, addr_infos[1].len,
-         addr_infos[2].start, addr_infos[2].len
+         (unsigned long long)addr_infos[1].start, (unsigned long long)addr_infos[1].len,
+         (unsigned long long)addr_infos[2].start, (unsigned long long)addr_infos[2].len
+       );
+    } else if (!strcmp(region_flag, "linux-2-npucore-ch1-buf")) {
+      addr_infos[3].start = zone0_ram_ipa;
+      addr_infos[3].len = mem_size;
+      printf("[Attention] linux-2-npucore-ch1-buf: start: 0x%llx, len: 0x%llx\n", (unsigned long long)addr_infos[3].start, (unsigned long long)addr_infos[3].len);
+    } else if(!strcmp(region_flag, "linux-2-npucore-ch1-msg")) {
+      addr_infos[4].start = zone0_ram_ipa;
+      addr_infos[4].len = mem_size;
+      addr_infos[5].start = zonex_ram_ipa;
+      addr_infos[5].len = mem_size;
+      printf("[Attention] linux-2-npucore-ch1-msg: zone0_ram_ipa: 0x%llx, len: 0x%llx, zonex_ram_ipa: 0x%llx, len: 0x%llx\n", 
+         (unsigned long long)addr_infos[4].start, (unsigned long long)addr_infos[4].len,
+         (unsigned long long)addr_infos[5].start, (unsigned long long)addr_infos[5].len
+       );
+    } else if (!strcmp(region_flag, "linux-2-npucore-ch2-buf")) {
+      addr_infos[6].start = zone0_ram_ipa;
+      addr_infos[6].len = mem_size;
+      printf("[Attention] linux-2-npucore-ch2-buf: start: 0x%llx, len: 0x%llx\n", (unsigned long long)addr_infos[6].start, (unsigned long long)addr_infos[6].len);
+    } else if(!strcmp(region_flag, "linux-2-npucore-ch2-msg")) {
+      addr_infos[7].start = zone0_ram_ipa;
+      addr_infos[7].len = mem_size;
+      addr_infos[8].start = zonex_ram_ipa;
+      addr_infos[8].len = mem_size;
+      printf("[Attention] linux-2-npucore-ch2-msg: zone0_ram_ipa: 0x%llx, len: 0x%llx, zonex_ram_ipa: 0x%llx, len: 0x%llx\n", 
+         (unsigned long long)addr_infos[7].start, (unsigned long long)addr_infos[7].len,
+         (unsigned long long)addr_infos[8].start, (unsigned long long)addr_infos[8].len
        );
     } else {
       printf("[Error] parse_global_addr: Invalid region flag: %s\n", region_flag);

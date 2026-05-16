@@ -1088,17 +1088,18 @@ int general_safe_service_request(struct Client* amp_client,
 static int hyper_amp_client(int argc, char* argv[]) {
     // 参数检查
     if (argc < 3) {
-        printf("Usage: hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
+        printf("Usage: hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id> [channel_id]\n");
         printf("Examples:\n");
         printf("  hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
         printf("  hvisor shm hyper_amp shm_config.json @data.txt 2\n");
-        printf("  hvisor shm hyper_amp shm_config.json hex:48656c6c6f 2  (hex input)\n");
+        printf("  hvisor shm hyper_amp shm_config.json \"channel 1 test\" 1 1\n");
         return -1;
     }
     
     char* shm_json_path = argv[0];
     char* data_input = argv[1];
     uint32_t service_id = (argc >= 3) ? strtoul(argv[2], NULL, 10) : NPUCore_SERVICE_ECHO_ID;
+    int channel_id = (argc >= 4) ? atoi(argv[3]) : -1;
     
     // 数据处理：支持直接字符串或从文件读取
     char* data_buffer = NULL;
@@ -1208,11 +1209,21 @@ static int hyper_amp_client(int argc, char* argv[]) {
     printf("Configuration: %s\n", shm_json_path);
     printf("Service ID: %u\n", service_id);
     printf("Data size: %d bytes\n", data_size);
+    if (channel_id >= 0) {
+        printf("Channel ID: %d\n", channel_id);
+    }
     
     parse_global_addr(shm_json_path);
     //初始化客户端
     struct Client amp_client = { 0 };
-    if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0)
+    int init_ret;
+    if (channel_id >= 0) {
+        init_ret = client_ops.client_init_by_channel(&amp_client, channel_id);
+    } else {
+        init_ret = client_ops.client_init(&amp_client, ZONE_NPUcore_ID);
+    }
+
+    if (init_ret != 0)
     {
         printf("error: client init failed\n");
         free(data_buffer);
@@ -3354,12 +3365,13 @@ int main(int argc, char *argv[]) {
             hyper_amp_service(argv[3]);
         }
         else if(strcmp(argv[2], "hyper_amp") == 0) {
-            // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>
+            // hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id> [channel_id]
             if (argc < 5) {
-                printf("Usage: ./hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id>\n");
+                printf("Usage: ./hvisor shm hyper_amp <shm_json_path> <data|@filename> <service_id> [channel_id]\n");
                 printf("Examples:\n");
                 printf("  ./hvisor shm hyper_amp shm_config.json \"hello world\" 1\n");
                 printf("  ./hvisor shm hyper_amp shm_config.json @data.txt 2\n");
+                printf("  ./hvisor shm hyper_amp shm_config.json \"channel 2 test\" 1 2\n");
                 return -1;
             }
             hyper_amp_client(argc - 3, &argv[3]);

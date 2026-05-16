@@ -29,11 +29,25 @@ static struct HyperAMPCtrl* hyperamp_ctrl = NULL;
 // TODO: add channel mutex init
 struct Channel channels[] = 
 {
-  { /* 0: channel 1 -> Linux to NPUCore */
+  { /* 0: channel 0 -> Linux to NPUCore */
     .channel_info = LINUX_2_NPUCore_CHANNEL_INFO,
     .msg_queue = NULL,
     .msg_queue_mutex = NULL,
     // .reg_msg = NULL,
+    .msg_queue_mutex_start = NULL,
+    .msg_queue_mutex_start_pa = 0,
+  },
+  { /* 1: channel 1 -> Linux to NPUCore CH1 */
+    .channel_info = LINUX_2_NPUCore_CH1_CHANNEL_INFO,
+    .msg_queue = NULL,
+    .msg_queue_mutex = NULL,
+    .msg_queue_mutex_start = NULL,
+    .msg_queue_mutex_start_pa = 0,
+  },
+  { /* 2: channel 2 -> Linux to NPUCore CH2 */
+    .channel_info = LINUX_2_NPUCore_CH2_CHANNEL_INFO,
+    .msg_queue = NULL,
+    .msg_queue_mutex = NULL,
     .msg_queue_mutex_start = NULL,
     .msg_queue_mutex_start_pa = 0,
   },
@@ -247,9 +261,9 @@ int32_t channels_init(void)
             // printf("channels_init_info: msg queue mutex mmap = %p\n", 
             //     channel->msg_queue_mutex_start);
 
-            // attention: channel_id start from 1    
+            // attention: channel_id starts from 0    
             channel->msg_queue_mutex = channel->msg_queue_mutex_start + 
-                (channel->channel_info->channel_id - 1) * MSG_QUEUE_MUTEX_SIZE; 
+                channel->channel_info->channel_id * MSG_QUEUE_MUTEX_SIZE; 
             
             /* 初始化互斥体 */
             if (msg_queue_mutex_ops.mutex_is_init(channel->msg_queue_mutex)!= 0)
@@ -326,6 +340,19 @@ struct Channel* target_channel_get(uint32_t target_zone_id)
     }
     printf("[WARN] target_channel_get, not found : target_zone_id = %u\n", target_zone_id);
 
+    return NULL;
+}
+
+struct Channel* target_channel_get_by_id(uint32_t channel_id)
+{
+    int i = 0;
+    for (i = 0; channels[i].channel_info != NULL; i++)
+    {
+        if (channels[i].channel_info->channel_id == channel_id) {
+            return &channels[i];
+        }
+    }
+    printf("[WARN] target_channel_get_by_id, not found : channel_id = %u\n", channel_id);
     return NULL;
 }
 

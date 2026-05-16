@@ -29,7 +29,7 @@ int hyperamp_client(int argc, char* argv[]) {
 
     // 参数检查
     if (argc < 3) {
-        printf("Usage: ./hvisor shm hyperamp_client <shm_json_path> <data|@filename> <service_id>\n");
+        printf("Usage: ./hvisor shm hyperamp_client <shm_json_path> <data|@filename> <service_id> [channel_id]\n");
         printf("Examples:\n");
         printf("  ./hvisor shm hyperamp_client shm_config.json \"hello world\" 1\n");
         printf("  ./hvisor shm hyperamp_client shm_config.json @data.txt 2\n");
@@ -40,6 +40,7 @@ int hyperamp_client(int argc, char* argv[]) {
     char* shm_json_path = argv[0];
     char* data_input = argv[1];
     uint32_t service_id = (argc >= 3) ? strtoul(argv[2], NULL, 10) : NPUCore_SERVICE_ECHO_ID;
+    int channel_id = (argc >= 4) ? atoi(argv[3]) : -1;
     
     // 数据处理：支持直接字符串或从文件读取
     char* data_buffer = NULL;
@@ -60,7 +61,14 @@ int hyperamp_client(int argc, char* argv[]) {
     
     // 初始化客户端
     struct Client amp_client = { 0 };
-    if (client_ops.client_init(&amp_client, ZONE_NPUcore_ID) != 0) {
+    int init_ret;
+    if (channel_id >= 0) {
+        init_ret = client_ops.client_init_by_channel(&amp_client, channel_id);
+    } else {
+        init_ret = client_ops.client_init(&amp_client, ZONE_NPUcore_ID);
+    }
+
+    if (init_ret != 0) {
         printf("error: client init failed\n");
         free(data_buffer);
         return -1;
